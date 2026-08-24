@@ -1,0 +1,80 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  :root {
+    --bg: #0d0e10;
+    --panel: #111216;
+    --border: #1e1f26;
+    --accent: #00ffd2;
+    --accent-dim: rgba(0, 255, 210, 0.4);
+    --text-main: #e0e0e0;
+    --text-dim: #6b6f76;
+    --btn-panel: #1c1f26;
+  }
+
+  body {
+    @apply bg-[var(--bg)] text-[var(--text-main)] overflow-hidden;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    background-image: 
+      radial-gradient(circle at 50% 0%, rgba(0, 255, 210, 0.05) 0%, transparent 50%),
+      url("data:image/svg+xml,%3Csvg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 0h1v1H0V0zm1 1h1v1H1V1z' fill='%23ffffff' fill-opacity='0.02' fill-rule='evenodd'/%3E%3C/svg%3E");
+  }
+
+  /* Custom Slider Styling */
+  input[type='range'] {
+    @apply accent-[var(--accent)] bg-black/40 h-1.5 rounded-full outline-none;
+  }
+
+  input[type='range']::-webkit-slider-thumb {
+    @apply w-3 h-3 rounded-full bg-white border-2 border-[var(--accent)] appearance-none cursor-pointer shadow-[0_0_10px_var(--accent-dim)] transition-all hover:scale-110 active:bg-[var(--accent)];
+  }
+}
+
+.studio-grid {
+  background-image: linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+.knob-glow {
+  box-shadow: 0 0 15px var(--accent-dim);
+}
+
+.module-card {
+  @apply bg-[var(--btn-panel)] border border-[var(--border)] rounded-lg p-4;
+}
+
+.status-dot {
+  @apply w-2 h-2 bg-[var(--accent)] rounded-full;
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.btn-primary {
+  @apply bg-[var(--accent)] text-black font-bold py-3 rounded-md uppercase tracking-wider text-sm hover:brightness-110 active:scale-[0.98] transition-all;
+}
+
+.knob-track {
+  @apply w-12 h-12 rounded-full border-4 border-[#111] relative;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+

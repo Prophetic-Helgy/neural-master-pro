@@ -1,0 +1,71 @@
+{
+  "name": "neural-master-pro",
+  "productName": "Neural Master Pro 2.2",
+  "description": "Premium AI-powered audio mastering application with real-time Faust DSP engine.",
+  "author": "Oleg",
+  "private": true,
+  "version": "2.2.0",
+  "type": "module",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "node copy-faust.js && node copy-ffmpeg.js && vite --port=3000 --host=0.0.0.0",
+    "build": "node copy-faust.js && node copy-ffmpeg.js && vite build",
+    "build:exe": "npm run build && electron-builder --config electron-builder-portable.json --win",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.neuralmasterpro.app",
+    "directories": {
+      "buildResources": "public"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "public/logo_Neural Master Pro.png"
+    },
+    "files": [
+      "dist/**/*",
+      "main.cjs"
+    ],
+    "extraResources": [
+      "NeuralMasterTempServer.exe"
+    ]
+  },
+  "dependencies": {
+    "@ffmpeg/core": "0.12.10",
+    "@ffmpeg/ffmpeg": "0.12.15",
+    "@google/genai": "^1.3.0",
+    "@grame/faustwasm": "^0.16.1",
+    "@mediabunny/flac-encoder": "^1.55.2",
+    "@mediabunny/mp3-encoder": "^1.55.2",
+    "clsx": "^2.1.1",
+    "fflate": "^0.8.3",
+    "lucide-react": "^0.460.0",
+    "mediabunny": "^1.55.2",
+    "motion": "^11.11.17",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "systeminformation": "^5.31.5",
+    "tailwind-merge": "^2.5.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^25.6.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.2.1",
+    "electron": "^41.2.1",
+    "electron-builder": "^26.8.1",
+    "flac-decoder": "^0.1.4",
+    "postcss": "^8.4.47",
+    "puppeteer-core": "^25.8.0",
+    "sharp": "^0.34.5",
+    "tailwindcss": "^4.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "wait-on": "^9.0.5"
+  }
+}

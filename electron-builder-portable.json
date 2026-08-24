@@ -1,0 +1,28 @@
+{
+  "appId": "com.neuralmasterpro.app",
+  "productName": "Neural Master Pro 2.2",
+  "directories": {
+    "buildResources": "public"
+  },
+  "files": [
+    "dist/**/*",
+    "main.cjs",
+    "public/logo.ico"
+  ],
+  "extraResources": [
+    "NeuralMasterTempServer.exe"
+  ],
+  "win": {
+    "icon": "public/logo.ico",
+    "target": [
+      {
+        "target": "portable",
+        "arch": ["x64"]
+      },
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ]
+  }
+}
