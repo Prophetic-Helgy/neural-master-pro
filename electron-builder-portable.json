@@ -2,7 +2,8 @@
   "appId": "com.neuralmasterpro.app",
   "productName": "Neural Master Pro 2.2",
   "directories": {
-    "buildResources": "public"
+    "buildResources": "public",
+    "output": "release"
   },
   "files": [
     "dist/**/*",
