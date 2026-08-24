@@ -167,6 +167,80 @@ function webglGpuName(): string {
   }
 }
 
+// --- Transport time display ------------------------------------------------
+// App used to hold `currentTime` as state polled at 10 Hz, which re-rendered
+// the whole ~2100-line JSX tree ten times a second. The time readout + seek
+// bar now live in a small component with its own state, so only it re-renders
+// at the polling rate.
+
+const formatTime = (time: number) => {
+  const mins = Math.floor(time / 60);
+  const secs = Math.floor(time % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+};
+
+const TimeControls: React.FC<{
+  engineRef: React.MutableRefObject<AudioEngine | null>;
+  duration: number;
+  hasTrack: boolean;
+  onSeek: (t: number) => void;
+}> = ({ engineRef, duration, hasTrack, onSeek }) => {
+  const [time, setTime] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const eng = engineRef.current;
+      if (eng) setTime(eng.getCurrentTime());
+    }, 100);
+    return () => clearInterval(interval);
+  }, [engineRef]);
+
+  return (
+    <div className="mb-2 space-y-1 relative">
+      <div className="flex justify-between text-[10px] font-mono text-[var(--text-dim)] mb-1">
+        <span>{formatTime(time)}</span>
+        <span>{formatTime(duration)}</span>
+      </div>
+      <div className="relative w-full h-[6px] flex items-center bg-[#1a1c22] rounded-full overflow-hidden">
+        <div
+          className="absolute left-0 top-0 h-full bg-[#333] transition-all rounded-full pointer-events-none"
+          style={{ width: `${duration > 0 ? (time / duration) * 100 : 0}%` }}
+        />
+        <input
+          type="range"
+          min="0"
+          max={duration || 100}
+          step="0.01"
+          value={time}
+          onChange={(e) => {
+            const v = parseFloat(e.target.value);
+            setTime(v); // optimistic; the engine position comes back on the next poll
+            onSeek(v);
+          }}
+          disabled={!hasTrack}
+          className="absolute top-0 left-0 w-full h-[12px] appearance-none bg-transparent m-0 p-0 cursor-pointer outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-2 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:rounded-sm disabled:opacity-10 z-20"
+        />
+      </div>
+    </div>
+  );
+};
+
+/** Video-export ETA line with its own 10 Hz poll (see TimeControls note). */
+const VideoExportProgress: React.FC<{
+  engineRef: React.MutableRefObject<AudioEngine | null>;
+  duration: number;
+}> = ({ engineRef, duration }) => {
+  const [time, setTime] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const eng = engineRef.current;
+      if (eng) setTime(eng.getCurrentTime());
+    }, 100);
+    return () => clearInterval(interval);
+  }, [engineRef]);
+  return <>{Math.min(100, Math.floor((time / duration) * 100))}% - ETA: {formatTime(duration - time)}</>;
+};
+
 export default function App() {
   const [lang, setLang] = useState<Language>('en');
   const [activeStem, setActiveStem] = useState<TargetStem>('master');
@@ -255,6 +329,10 @@ export default function App() {
     };
     setEffectRegions([...effectRegions, newReg]);
     setActiveFXRegionId(newReg.id);
+    // Auto-selection above silently switches the five FX sliders into
+    // region-edit mode (they write into this window only, 0–20 s). Make it
+    // visible or it reads as "FX don't work" outside the window.
+    showToast(`${i18n[lang].fxRegionEditingHint} (${newReg.start}s–${Math.round(newReg.end)}s)`, 'warn');
   };
 
   const handleRemoveFXRegion = (id: string) => {
@@ -393,10 +471,13 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [visMode, setVisMode] = useState<'bars' | 'circle' | 'wave' | 'alchemy' | 'circles' | 'flight' | 'smoke'>('bars');
-  const [monitoringMode, setMonitoringMode] = useState<'master' | 'source' | 'reference'>('source');
+  // Default 'master': a mastering app must process out of the box.
+  // A/B against the original is one click away (SOURCE/REFERENCE buttons).
+  // (Was 'source' — left the whole DSP chain bypassed and hard-disabled
+  // every Pro slider on first launch, so FX "didn't work".)
+  const [monitoringMode, setMonitoringMode] = useState<'master' | 'source' | 'reference'>('master');
   const [showLogs, setShowLogs] = useState(false);
   const [llmConfig, setLlmConfigState] = useState<LlmConfig | null>(() => loadLlmConfig());
   const [showLlmSettings, setShowLlmSettings] = useState(false);
@@ -424,7 +505,10 @@ export default function App() {
   const [videoRes, setVideoRes] = useState<'fhd' | '2k' | '4k'>('fhd');
   const [videoFps, setVideoFps] = useState<30 | 60>(30);
   const [videoBitrate, setVideoBitrate] = useState<'low' | 'medium' | 'high'>('medium');
-  const [exportCanvasNode, setExportCanvasNode] = useState<HTMLCanvasElement | null>(null);
+  // Refs (not state): the hidden export canvas is mounted only while a video
+  // export runs (see isExportingVideo below), so handleExport — an async
+  // closure over one render — must read the nodes through refs, not stale state.
+  const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isExportingVideo, setIsExportingVideo] = useState(false);
 
   // Pexels stock-video background states
@@ -438,7 +522,7 @@ export default function App() {
   const [pexelsClipUrl, setPexelsClipUrl] = useState<string | null>(null);
   const [pexelsError, setPexelsError] = useState<string | null>(null);
   const [showCredit, setShowCredit] = useState(true);
-  const [bgVideoEl, setBgVideoEl] = useState<HTMLVideoElement | null>(null);
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const pendingDownloadRef = useRef<Promise<string | null> | null>(null);
   const pexelsClipUrlRef = useRef<string | null>(null);
 
@@ -459,18 +543,23 @@ export default function App() {
     audioEngine.current.setOnEnded(() => setIsPlaying(false));
     audioEngine.current.setOnError((msg) => showToast(msg, 'error'));
     
-    // Apply default settings and initial monitoring mode immediately on init
+    // Apply default settings and initial monitoring mode immediately on init.
+    // monitoringMode defaults to 'master' — the DSP chain is live from startup;
+    // SOURCE/REFERENCE buttons bypass it for A/B.
     audioEngine.current.updateSettings(settings);
-    audioEngine.current.setBypass(true); // Since source is default
-    
-    // Polling for time progress
-    const interval = setInterval(() => {
-      if (audioEngine.current) {
-        setCurrentTime(audioEngine.current.getCurrentTime());
-      }
-    }, 100);
+    audioEngine.current.setBypass(false);
+    // (Time progress polling moved to <TimeControls> — see module scope.)
 
-    return () => clearInterval(interval);
+    // DEV-only hook for the browser E2E suite (scripts/e2e.cjs): exposes the
+    // live engine so tests can read DSP param values and analyser snapshots,
+    // plus a copy of the neutral settings (offline renderProPcm baselines).
+    // import.meta.env.DEV is false in production builds → stripped there.
+    if (import.meta.env.DEV) {
+      (window as unknown as Record<string, unknown>).__NMP__ = {
+        getEngine: () => audioEngine.current,
+        getNeutralSettings: () => ({ ...NEUTRAL_SETTINGS }),
+      };
+    }
   }, []);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -521,9 +610,18 @@ export default function App() {
         setMetadata(prev => ({ ...prev, title: file.name.split('.')[0] }));
       }
 
-      audioEngine.current.measureTrack(audioEngine.current.getBuffer())
-        .then(setTrackMetrics)
-        .finally(() => setTrackMetricsBusy(false));
+      // Defer the heavy true-peak/LUFS pass (4× 256-tap FIR over the whole
+      // buffer, run as setTimeout(0) chunks) ~2 s after upload: firing it
+      // immediately landed those chunks on the main thread at exactly the
+      // moment playback starts — the first-seconds stutter.
+      const measureBuf = audioEngine.current.getBuffer();
+      setTimeout(() => {
+        const eng = audioEngine.current;
+        if (!eng || eng.getBuffer() !== measureBuf) return; // track swapped meanwhile
+        eng.measureTrack(measureBuf)
+          .then(m => { if (m) setTrackMetrics(m); })
+          .finally(() => setTrackMetricsBusy(false));
+      }, 2000);
     }
   };
 
@@ -593,7 +691,8 @@ export default function App() {
   const handleSeek = (time: number) => {
     if (audioEngine.current) {
       audioEngine.current.seek(time);
-      setCurrentTime(time);
+      // <TimeControls> picks the new position up on its next 100 ms poll
+      // (and updates optimistically on drag), so no App-level state needed.
     }
   };
 
@@ -726,12 +825,6 @@ export default function App() {
     setTimeout(() => setIsSavedFlash(false), 1500);
   };
 
-  const formatTime = (time: number) => {
-    const mins = Math.floor(time / 60);
-    const secs = Math.floor(time % 60);
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
-  };
-
   const isVert = videoOrientation === 'vertical';
   const baseW = videoRes === 'fhd' ? 1080 : videoRes === '2k' ? 1440 : 2160;
   const baseH = videoRes === 'fhd' ? 1920 : videoRes === '2k' ? 2560 : 3840;
@@ -832,7 +925,25 @@ export default function App() {
         downloadBlob(enc.blob, `${fileNameBase}_NeuralMaster.${enc.ext}`);
       }
 
-      if (exportVideo && exportCanvasNode) {
+      if (exportVideo) {
+        // Mount the hidden high-res canvas only for the duration of the export.
+        // It was always-mounted before: up to a 2160×3840 canvas drawing every
+        // frame during normal playback (the visualizer rendered twice).
+        setIsExportingVideo(true);
+        await new Promise<void>((resolve) => {
+          const t0 = Date.now();
+          const poll = () =>
+            exportCanvasRef.current || Date.now() - t0 > 3000
+              ? resolve()
+              : setTimeout(poll, 50);
+          poll();
+        });
+        if (!exportCanvasRef.current) {
+          setIsExportingVideo(false);
+          throw new Error('Export canvas failed to mount');
+        }
+        const exportCanvas = exportCanvasRef.current;
+
         // Wait for the Pexels background clip to finish downloading
         if (pendingDownloadRef.current) {
           await pendingDownloadRef.current;
@@ -840,16 +951,20 @@ export default function App() {
 
         // Pexels background: seek to 0 and wait for the first frame (up to 8s),
         // BEFORE the audio starts — otherwise the clip and the track desync.
+        // The <video> element appears when the URL state lands (may arrive
+        // during this wait — the ref is refreshed by onBgVideoReady).
         // If it never becomes ready, the draw loop simply skips the video frame
         // (readyState guard), so the export degrades to the visualizer only.
-        if (videoBgMode === 'pexels' && pexelsClipUrl && bgVideoEl) {
-          if (bgVideoEl.readyState >= 1) bgVideoEl.currentTime = 0;
-          bgVideoEl.play().catch(() => {});
+        if (videoBgMode === 'pexels' && pexelsClipUrl) {
           const waitStart = Date.now();
-          while (bgVideoEl.readyState < 2 && Date.now() - waitStart < 8000) {
+          let bg = bgVideoRef.current;
+          while ((!bg || bg.readyState < 2) && Date.now() - waitStart < 8000) {
             await new Promise(r => setTimeout(r, 100));
+            bg = bgVideoRef.current;
           }
-          if (bgVideoEl.readyState < 2) {
+          if (bg && bg.readyState >= 1) bg.currentTime = 0;
+          bg?.play().catch(() => {});
+          if (!bg || bg.readyState < 2) {
             console.warn('[NMP] Pexels background not ready in 8s — exporting visualizer only');
           }
         }
@@ -867,7 +982,6 @@ export default function App() {
         const recEnd = Math.min(Number(trimEnd) || 0, duration) || duration;
         const recLenSec = Math.max(0, recEnd - recStart);
 
-        setIsExportingVideo(true);
         audioEngine.current.seek(recStart);
         audioEngine.current.play();
         setIsPlaying(true);
@@ -875,7 +989,7 @@ export default function App() {
         const dest = audioEngine.current.getAudioContext().createMediaStreamDestination();
         audioEngine.current.getMonitorGain().connect(dest);
 
-        const videoStream = exportCanvasNode.captureStream(videoFps);
+        const videoStream = exportCanvas.captureStream(videoFps);
         const combinedStream = new MediaStream([
           ...videoStream.getVideoTracks(),
           ...dest.stream.getAudioTracks()
@@ -911,8 +1025,8 @@ export default function App() {
         
         const videoPromise = new Promise<void>((resolve, reject) => {
           let reqId: number;
-          if (exportCanvasNode) {
-            const ctx = exportCanvasNode.getContext('2d');
+          if (exportCanvas) {
+            const ctx = exportCanvas.getContext('2d');
             const forceDraw = () => {
               if (ctx) {
                 const pd = ctx.getImageData(0,0,1,1);
@@ -954,7 +1068,7 @@ export default function App() {
         await new Promise(r => setTimeout(r, ms + 100)); // wait for the trimmed region to play
 
         recorder.stop();
-        bgVideoEl?.pause();
+        bgVideoRef.current?.pause();
         // With trimEnd < track end the source is still playing — stop it and
         // restore the user's monitor mode.
         audioEngine.current.stop();
@@ -981,22 +1095,26 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-[var(--bg)] font-sans">
-      {/* Hidden high-res canvas for video export */}
-      <div style={{ position: 'fixed', top: '-9999px', left: '-9999px', opacity: 0.01, pointerEvents: 'none' }}>
-        <AudioVisualizer
-          analyser={audioEngine.current?.getAnalysers()?.L || null}
-          mode={visMode}
-          coverArt={coverArt || './logo_Neural Master Pro.png'}
-          width={expW}
-          height={expH}
-          exportMode={true}
-          metadata={metadata}
-          onCanvasReady={setExportCanvasNode}
-          bgVideoUrl={videoBgMode === 'pexels' ? pexelsClipUrl : null}
-          creditText={videoBgMode === 'pexels' && showCredit && selectedClip ? `${(t as any).videoAuthor || 'Video:'} Pexels / ${selectedClip.user.name}` : null}
-          onBgVideoReady={setBgVideoEl}
-        />
-      </div>
+      {/* Hidden high-res canvas for video export — mounted ONLY while an
+          export runs. Always-mounted before, it cost a full 2160×3840 paint
+          per frame during normal playback (B1). */}
+      {isExportingVideo && (
+        <div style={{ position: 'fixed', top: '-9999px', left: '-9999px', opacity: 0.01, pointerEvents: 'none' }}>
+          <AudioVisualizer
+            analyser={audioEngine.current?.getAnalysers()?.L || null}
+            mode={visMode}
+            coverArt={coverArt || './logo_Neural Master Pro.png'}
+            width={expW}
+            height={expH}
+            exportMode={true}
+            metadata={metadata}
+            onCanvasReady={(c) => { exportCanvasRef.current = c; }}
+            bgVideoUrl={videoBgMode === 'pexels' ? pexelsClipUrl : null}
+            creditText={videoBgMode === 'pexels' && showCredit && selectedClip ? `${(t as any).videoAuthor || 'Video:'} Pexels / ${selectedClip.user.name}` : null}
+            onBgVideoReady={(v) => { bgVideoRef.current = v; }}
+          />
+        </div>
+      )}
 
       {/* Header */}
       <header className="h-[60px] bg-[var(--panel)] border-b border-[var(--border)] flex items-center justify-between px-6 shrink-0 relative" style={{ WebkitAppRegion: 'drag' } as any}>
@@ -1702,29 +1820,8 @@ export default function App() {
           </div>
           </>)}
 
-          {/* Seek Bar */}
-          <div className="mb-2 space-y-1 relative">
-            <div className="flex justify-between text-[10px] font-mono text-[var(--text-dim)] mb-1">
-              <span>{formatTime(currentTime)}</span>
-              <span>{formatTime(duration)}</span>
-            </div>
-            <div className="relative w-full h-[6px] flex items-center bg-[#1a1c22] rounded-full overflow-hidden">
-              <div 
-                className="absolute left-0 top-0 h-full bg-[#333] transition-all rounded-full pointer-events-none" 
-                style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
-              />
-              <input 
-                type="range"
-                min="0"
-                max={duration || 100}
-                step="0.01"
-                value={currentTime}
-                onChange={(e) => handleSeek(parseFloat(e.target.value))}
-                disabled={!track}
-                className="absolute top-0 left-0 w-full h-[12px] appearance-none bg-transparent m-0 p-0 cursor-pointer outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-2 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:rounded-sm disabled:opacity-10 z-20"
-              />
-            </div>
-          </div>
+          {/* Seek Bar (own 10 Hz time state — keeps App off the hot path) */}
+          <TimeControls engineRef={audioEngine} duration={duration} hasTrack={!!track} onSeek={handleSeek} />
 
           {/* Metering Bridge */}
           <MeteringBridge isPlaying={isPlaying} analysers={audioEngine.current?.getAnalysers() || null} lang={lang} />
@@ -2059,9 +2156,13 @@ export default function App() {
       </footer>
 
       {/* Overlays */}
+      {/* AnimatePresence keys unkeyed children as "" — two present at once
+          (e.g. "Mastering" exit + "Done" enter) trip React's duplicate-key
+          warning, so each overlay needs a stable key. */}
       <AnimatePresence>
         {isProcessing && (
-          <motion.div 
+          <motion.div
+            key="processing"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -2072,7 +2173,7 @@ export default function App() {
               <h3 className="text-lg font-bold text-white tracking-widest uppercase">{t.rendering}</h3>
               <p className="text-[10px] text-[var(--text-dim)] uppercase tracking-wider mt-2">
                  {isExportingVideo && duration > 0 ? (
-                    `${Math.min(100, Math.floor((currentTime / duration) * 100))}% - ETA: ${formatTime(duration - currentTime)}`
+                    <VideoExportProgress engineRef={audioEngine} duration={duration} />
                  ) : t.neuralProgress}
               </p>
             </div>
@@ -2080,7 +2181,8 @@ export default function App() {
         )}
 
         {showDone && (
-          <motion.div 
+          <motion.div
+            key="done"
             initial={{ y: 50, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: 50, opacity: 0 }}
@@ -2093,6 +2195,7 @@ export default function App() {
 
         {autoMasterNote && (
           <motion.div
+            key="auto-note"
             initial={{ y: 50, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: 50, opacity: 0 }}

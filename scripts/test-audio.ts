@@ -28,9 +28,11 @@ import { LITE_PRESETS, presetToSettings } from '../src/lib/presets.ts';
 import { decodeWavSamples, encodeWav } from '../src/lib/wavEncode.ts';
 import { encodeAudio } from '../src/lib/exportEncoders.ts';
 import { buildAacArgs } from '../src/lib/aacEncoder.ts';
+import { applyChangedParams, PARAM_EPS } from '../src/lib/paramDiff.ts';
 import { spawnSync } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -772,6 +774,124 @@ async function t20(): Promise<void> {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * t22 — automation dirty-set (paramDiff.applyChangedParams).
+ *
+ * This is the pure core of the B4 fix: AudioEngine's automation tick and
+ * updateSettings both push params through it, so steady-state playback must
+ * post ZERO messages while any changed value reaches the worklet on the
+ * very next pass. AudioEngine itself is browser-only (WebAudio + WASM),
+ * hence the unit lives against the extracted helper.
+ */
+function t22(): void {
+  console.log('\nT22. automation dirty-set (applyChangedParams)');
+
+  // (a) First pass: nothing cached → everything is "changed", apply in key order.
+  {
+    const last = new Map<string, number>();
+    const seen: Array<[string, number]> = [];
+    const values = { reverb: 0.2, delay: 0.5, chorus: 0.0 };
+    const applied = applyChangedParams(last, values, (n, v) => seen.push([n, v]));
+    check('first pass applies all keys', applied.length === 3 && JSON.stringify(applied) === JSON.stringify(['reverb', 'delay', 'chorus']), JSON.stringify(applied));
+    check('first pass values forwarded', JSON.stringify(seen) === JSON.stringify([['reverb', 0.2], ['delay', 0.5], ['chorus', 0.0]]), JSON.stringify(seen));
+  }
+
+  // (b) Identical values: zero posts (steady-state playback).
+  {
+    const last = new Map<string, number>();
+    let posts = 0;
+    applyChangedParams(last, { reverb: 0.2, delay: 0.5 }, () => { /* cache warm-up, not counted */ });
+    let lastAppliedLen = 0;
+    for (let tick = 0; tick < 40; tick += 1) {
+      lastAppliedLen = applyChangedParams(last, { reverb: 0.2, delay: 0.5 }, () => { posts += 1; }).length;
+    }
+    check('steady-state: 40 identical ticks post nothing', lastAppliedLen === 0 && posts === 0, `last applied=${lastAppliedLen}, posts=${posts}`);
+  }
+
+  // (c) Single changed param: only it is posted.
+  {
+    const last = new Map<string, number>([['reverb', 0.2], ['delay', 0.5]]);
+    let posts = 0;
+    const applied = applyChangedParams(last, { reverb: 0.2, delay: 0.9 }, (n, v) => { posts += 1; });
+    check('only the changed param applies', posts === 1 && JSON.stringify(applied) === JSON.stringify(['delay']), JSON.stringify(applied));
+    check('cache updated to new value', last.get('delay') === 0.9 && last.get('reverb') === 0.2, `delay=${last.get('delay')}, reverb=${last.get('reverb')}`);
+  }
+
+  // (d) Tolerance: sub-epsilon wobble skipped, super-epsilon applied.
+  {
+    const last = new Map<string, number>([['gain', 0.62]]);
+    let posts = 0;
+    applyChangedParams(last, { gain: 0.62 + PARAM_EPS / 2 }, () => { posts += 1; });
+    check('sub-epsilon delta skipped', posts === 0, `posts=${posts}`);
+    const applied = applyChangedParams(last, { gain: 0.62 + PARAM_EPS * 10 }, () => { posts += 1; });
+    check('super-epsilon delta applies', posts === 1 && JSON.stringify(applied) === JSON.stringify(['gain']), `posts=${posts}, applied=${JSON.stringify(applied)}`);
+  }
+
+  // (e) Brand-new param applies even when its value is 0 (0 is a legitimate
+  //     setting, not "unset" — undefined-vs-0 is the distinction the cache makes).
+  {
+    const last = new Map<string, number>([['reverb', 0.2]]);
+    let posts = 0;
+    const applied = applyChangedParams(last, { distortion: 0, reverb: 0.2 }, () => { posts += 1; });
+    check('new param at 0.0 applies', posts === 1 && JSON.stringify(applied) === JSON.stringify(['distortion']), JSON.stringify(applied));
+  }
+
+  // (f) Scale check mirroring the real call sites: 40 updateSettings-shaped
+  //     values per slider drag vs the 20-value automation tick — a slider
+  //     drag must cost exactly one post per moved param.
+  {
+    const last = new Map<string, number>();
+    let posts = 0;
+    const full = (): Record<string, number> => {
+      const v: Record<string, number> = {};
+      for (let i = 0; i < 40; i += 1) v[`p${i}`] = i === 5 ? 1.5 : i * 0.01;
+      return v;
+    };
+    applyChangedParams(last, full(), () => { posts += 1; });
+    check('cold 40-param push posts 40', posts === 40, `posts=${posts}`);
+    applyChangedParams(last, full(), () => { posts += 1; });
+    check('warm 40-param push posts 0', posts === 40, `posts=${posts}`);
+    const bumped = full();
+    bumped.p5 = 1.6;
+    applyChangedParams(last, bumped, () => { posts += 1; });
+    check('one param bump posts 1', posts === 41, `posts=${posts}`);
+  }
+}
+
+function t23(): void {
+  console.log('\nT23. i18n parity: 9 languages, same key sets as EN, no empty values');
+  // i18n.ts is NOT Node-importable (it value-imports a TS type from ../types),
+  // so this text-parses the literal table. Block shape: `  <lang>: { ... \n  },`.
+  const src = readFileSync(fileURLToPath(new URL('../src/lib/i18n.ts', import.meta.url)), 'utf8');
+  const langs = ['en', 'ru', 'zh', 'it', 'fr', 'es', 'ja', 'ko', 'ar'];
+  const blocks: Record<string, Record<string, string>> = {};
+  for (const lang of langs) {
+    const m = src.match(new RegExp(`^  ${lang}: \\{([\\s\\S]*?)\\n  \\},?`, 'm'));
+    check(`i18n block found: ${lang}`, !!m, m ? '' : 'regex miss');
+    if (!m) return;
+    const keys: Record<string, string> = {};
+    for (const line of m[1].split('\n')) {
+      const km = line.match(/^\s{4,}([A-Za-z0-9_]+):\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/);
+      if (km) keys[km[1]] = (km[2] ?? km[3] ?? '').replace(/\\(['"\\])/g, '$1');
+    }
+    blocks[lang] = keys;
+  }
+  const enKeys = Object.keys(blocks.en).sort();
+  check('EN key count sanity (>= 100)', enKeys.length >= 100, `en=${enKeys.length}`);
+  for (const lang of langs) {
+    if (lang === 'en') continue;
+    const keys = Object.keys(blocks[lang]).sort();
+    const missing = enKeys.filter((k) => !(k in blocks[lang]));
+    const extra = keys.filter((k) => !(k in blocks.en));
+    check(`${lang}: key set identical to EN`, missing.length === 0 && extra.length === 0,
+      [...missing, ...extra].slice(0, 8).join(',') || `${keys.length} keys`);
+    const empty = Object.entries(blocks[lang]).filter(([, v]) => v.trim() === '');
+    check(`${lang}: no empty values`, empty.length === 0, empty.map(([k]) => k).slice(0, 8).join(','));
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 async function main(): Promise<void> {
   console.log('Neural Master Pro — audio core known-value tests');
   // measureMetrics smoke (the combined entry point the UI will use)
@@ -803,6 +923,8 @@ async function main(): Promise<void> {
   await t18();
   await t19();
   await t20();
+  t22();
+  t23();
 
   console.log(`\n${'='.repeat(60)}`);
   console.log(`RESULT: ${passed} passed, ${failed} failed`);

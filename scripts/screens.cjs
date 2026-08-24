@@ -2,7 +2,7 @@
  * screens.cjs — release screenshots for docs/screenshots/ via
  * puppeteer-core + the system Edge (no Chrome download).
  *
- * Run:  node scripts/screens.cjs     (dev server on http://localhost:5210 must be up)
+ * Run:  node scripts/screens.cjs     (dev server on http://localhost:3000 must be up)
  *
  * 5 frames: 01 Pro mixer (default mode) · 02 Lite after mastering
  * (Before/After + findings) · 03 Batch + export panel (AAC) ·
@@ -14,7 +14,7 @@ const path = require('path');
 const fs = require('fs');
 
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const APP_URL = 'http://localhost:5210/';
+const APP_URL = 'http://localhost:3000/';
 const OUT_DIR = path.join(__dirname, '..', 'docs', 'screenshots');
 const TONE = path.join(OUT_DIR, 'tone_test.wav');
 

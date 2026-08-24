@@ -96,16 +96,26 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
     // We shouldn't store animationId only, but re-trigger
     const bufferLength = analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
+    // Shared time-domain buffer — circle/alchemy used to allocate a fresh
+    // Uint8Array(1024) every frame (GC churn at 60 fps).
+    const timeData = new Uint8Array(bufferLength);
     let animationId: number;
+    // Frame-jitter PRNG: Math.random() calls inside the draw loops (circle
+    // aura, swarm, flight) add up at 60 fps; a cheap LCG gives the same
+    // look without the native-call overhead.
+    let seed = 0x2f6e2b1;
+    const rand = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296;
 
     const flightStars: {x: number, y: number, z: number}[] = [];
     for(let i=0; i<150; i++) {
        flightStars.push({x: Math.random()*2-1, y: Math.random()*2-1, z: Math.random()});
     }
 
-    // Used for swarm (replacing smoke)
+    // Used for swarm (replacing smoke). 40 particles, not 150: each one is a
+    // per-frame createRadialGradient (the 150× radial-gradient path was the
+    // second-heaviest cost in the visualizer) and 40 still reads as a swarm.
     const swarmParticles: {x: number, y: number, vx: number, vy: number, baseHue: number, size: number}[] = [];
-    for(let i=0; i<150; i++) {
+    for(let i=0; i<40; i++) {
        swarmParticles.push({
           x: Math.random(),
           y: Math.random(),
@@ -136,18 +146,22 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
 
       if (mode === 'bars') {
         analyser.getByteFrequencyData(dataArray);
-        // Ensure it fills the full width by using exactly the right barWidth
-        const visibleBins = Math.floor(bufferLength * 0.7); // Only draw lower 70% of spectrum to fill up better
+        // Use exactly the right barWidth to fill the full width. Downsample
+        // to ~96 bars: 717 createLinearGradient calls/frame was the heaviest
+        // per-frame cost in the whole visualizer and is visually indistinguishable.
+        const usable = Math.floor(bufferLength * 0.7); // only lower 70% of spectrum
+        const binStep = Math.max(1, Math.floor(usable / 96));
+        const visibleBins = Math.floor(usable / binStep);
         const barWidth = canvas.width / visibleBins;
         let x = 0;
 
-        for (let i = 0; i < visibleBins; i++) {
+        for (let i = 0, b = 0; b < visibleBins; b++, i += binStep) {
           const barHeight = (dataArray[i] / 255) * canvas.height;
           // Use a gradient for bars
           const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - barHeight);
           gradient.addColorStop(0, '#00ffd2');
           gradient.addColorStop(1, '#0099ff');
-          
+
           ctx.fillStyle = gradient;
           // Add a tiny gap between bars if barWidth is large enough
           const gap = barWidth > 2 ? 1 : 0;
@@ -155,7 +169,6 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           x += barWidth;
         }
       } else if (mode === 'circle') {
-        const timeData = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteTimeDomainData(timeData);
         analyser.getByteFrequencyData(dataArray);
 
@@ -217,30 +230,30 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           if (val < 0.1) continue;
 
           const angle = (i / bufferLength) * Math.PI * 2;
-          const glitchOffset = (Math.random() - 0.5) * intensity * 50; 
-          
-          const length = val * radius * 1.5 + (Math.random() < 0.1 ? glitchOffset : 0);
+          const glitchOffset = (rand() - 0.5) * intensity * 50;
+
+          const length = val * radius * 1.5 + (rand() < 0.1 ? glitchOffset : 0);
           const startRadius = radius * 1.8 * currentScale;
           const endRadius = (radius * 1.8 + length) * currentScale;
 
           const x1 = centerX + Math.cos(angle + glitchOffset*0.01) * startRadius;
           const y1 = centerY + Math.sin(angle + glitchOffset*0.01) * startRadius;
-          
+
           const x2 = centerX + Math.cos(angle) * endRadius;
           const y2 = centerY + Math.sin(angle) * endRadius;
 
-          ctx.strokeStyle = `rgba(0, ${150 + Math.random()*105}, 255, ${0.4 + val*0.6})`;
-          ctx.lineWidth = Math.random() > 0.9 ? 3 : 1;
+          ctx.strokeStyle = `rgba(0, ${150 + rand()*105}, 255, ${0.4 + val*0.6})`;
+          ctx.lineWidth = rand() > 0.9 ? 3 : 1;
           ctx.beginPath();
           ctx.moveTo(x1, y1);
           ctx.lineTo(x2, y2);
           ctx.stroke();
 
           // Glitch disconnected dots
-          if (Math.random() > 0.8 && val > 0.5) {
+          if (rand() > 0.8 && val > 0.5) {
              ctx.fillStyle = ctx.strokeStyle;
-             const px = x2 + Math.cos(angle) * (Math.random() * 20 + 5);
-             const py = y2 + Math.sin(angle) * (Math.random() * 20 + 5);
+             const px = x2 + Math.cos(angle) * (rand() * 20 + 5);
+             const py = y2 + Math.sin(angle) * (rand() * 20 + 5);
              ctx.fillRect(px, py, 2, 2);
           }
         }
@@ -268,12 +281,12 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
         ctx.stroke();
       } else if (mode === 'alchemy') {
         analyser.getByteFrequencyData(dataArray);
-        
+
         // Deep blue background effect
         ctx.fillStyle = 'rgba(5, 10, 20, 0.2)';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        const timeData = new Uint8Array(analyser.frequencyBinCount);
+        // (shared `timeData` buffer, allocated once per effect run)
         analyser.getByteTimeDomainData(timeData);
         let rms = 0;
         for (let i = 0; i < timeData.length; i++) {
@@ -343,15 +356,18 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
             else ctx.lineTo(x, y);
           }
           ctx.closePath();
-          // Neon blue/cyan styling
+          // Neon blue/cyan styling. Glow is faked with a wide translucent
+          // under-stroke: shadowBlur forces a gaussian pass per stroke and
+          // was the slowest path in this mode.
+          const glowAlpha = (0.2 + (dataArray[c*5]/255)*0.8) * 0.35;
+          ctx.strokeStyle = `hsla(190, 100%, ${55 + c * 5}%, ${glowAlpha})`;
+          ctx.lineWidth = (2 + (dataArray[c*3]/255) * 3) + 6;
+          ctx.stroke();
           ctx.strokeStyle = `hsla(190, 100%, ${50 + c * 5}%, ${0.2 + (dataArray[c*5]/255)*0.8})`;
           ctx.lineWidth = 2 + (dataArray[c*3]/255) * 3;
-          ctx.shadowColor = '#00ffd2';
-          ctx.shadowBlur = 5 + (dataArray[c*2]/255) * 15;
           ctx.stroke();
         }
         ctx.globalCompositeOperation = 'source-over';
-        ctx.shadowBlur = 0;
       } else if (mode === 'flight') {
         analyser.getByteFrequencyData(dataArray);
         ctx.fillStyle = 'rgba(2, 6, 12, 0.3)';
@@ -370,8 +386,8 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
         flightStars.forEach(star => {
           star.z -= speed;
           if (star.z <= 0) {
-            star.x = Math.random() * 2 - 1;
-            star.y = Math.random() * 2 - 1;
+            star.x = rand() * 2 - 1;
+            star.y = rand() * 2 - 1;
             star.z = 1;
           }
           
@@ -414,8 +430,8 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
            const val = dataArray[bin] / 255.0;
            
            // Particle behavior: vibrate based on audio
-           p.x += p.vx + (Math.random() - 0.5) * val * 0.02;
-           p.y += p.vy + (Math.random() - 0.5) * val * 0.02;
+           p.x += p.vx + (rand() - 0.5) * val * 0.02;
+           p.y += p.vy + (rand() - 0.5) * val * 0.02;
            
            // Wrap around
            if (p.x < 0) p.x = 1; if (p.x > 1) p.x = 0;

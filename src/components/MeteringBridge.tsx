@@ -92,6 +92,11 @@ export const MeteringBridge: React.FC<MeteringBridgeProps> = ({ isPlaying, analy
     const dataR = new Float32Array(bufferLength);
     let tPrev = analysers.L.context.currentTime;
     let animationFrameId: number;
+    // UI updates at ~15 Hz; the analyser feed must stay at full rAF rate —
+    // the sample-accurate push below drops any frame whose gap exceeds the
+    // buffer (1024 samples ≈ 23 ms), so starving it would stall the LUFS chain.
+    let lastUi = 0;
+    let holdPeakL = 0, holdPeakR = 0, holdRms = 0, holdCorr = 0.5;
 
     const update = () => {
       analysers.L.getFloatTimeDomainData(dataL);
@@ -135,14 +140,33 @@ export const MeteringBridge: React.FC<MeteringBridgeProps> = ({ isPlaying, analy
       const divider = Math.sqrt(sumSqL * sumSqR);
       const correlation = divider > 1e-8 ? crossProduct / divider : 1;
 
-      setMeters(prev => ({
-        peakL: Math.max(prev.peakL * 0.92, maxL),
-        peakR: Math.max(prev.peakR * 0.92, maxR),
-        rms: Math.max(prev.rms * 0.85, rmsTotal),
-        lufs: meter.momentary,
-        stLufs: meter.shortTerm,
-        phase: prev.phase * 0.8 + (0.5 + (correlation * 0.5)) * 0.2
-      }));
+      // Peak-hold across skipped UI frames (max over the window).
+      holdPeakL = Math.max(holdPeakL, maxL);
+      holdPeakR = Math.max(holdPeakR, maxR);
+      holdRms = Math.max(holdRms, rmsTotal);
+      holdCorr = correlation;
+
+      const now = performance.now();
+      if (now - lastUi >= 66) {
+        // Decay factors re-based from per-frame values at 60 fps so the
+        // ballistics are identical at the new ~15 Hz update rate.
+        const dt = Math.max(0.016, (now - lastUi) / 1000);
+        const dp = Math.pow(0.92, 60 * dt);
+        const dr = Math.pow(0.85, 60 * dt);
+        const dph = Math.pow(0.8, 60 * dt);
+        lastUi = now;
+        setMeters(prev => ({
+          peakL: Math.max(prev.peakL * dp, holdPeakL),
+          peakR: Math.max(prev.peakR * dp, holdPeakR),
+          rms: Math.max(prev.rms * dr, holdRms),
+          lufs: meter.momentary,
+          stLufs: meter.shortTerm,
+          phase: prev.phase * dph + (0.5 + holdCorr * 0.5) * (1 - dph)
+        }));
+        holdPeakL = 0;
+        holdPeakR = 0;
+        holdRms = 0;
+      }
 
       animationFrameId = requestAnimationFrame(update);
     };

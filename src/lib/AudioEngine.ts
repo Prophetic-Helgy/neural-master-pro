@@ -9,6 +9,19 @@ import {
   measureMetrics,
   type PipelineMetrics,
 } from './audioMeters.ts';
+import { applyChangedParams } from './paramDiff.ts';
+
+/** MasteringSettings keys pushed to the live Faust chain (updateSettings). */
+const SETTING_PARAM_NAMES = [
+  'gain', 'lowShelf', 'midRange', 'highShelf', 'compression', 'limiter',
+  'saturation', 'exciterAmount', 'exciterFreq', 'haasAmount', 'stereoWidth',
+  'fundamentalFreq', 'eq31', 'eq62', 'eq125', 'eq250', 'eq500', 'eq1k',
+  'eq2k', 'eq4k', 'eq8k', 'eq16k', 'autotune', 'reverb', 'distortion',
+  'delay', 'chorus',
+  'bass_autotune', 'bass_reverb', 'bass_distortion', 'bass_delay', 'bass_chorus',
+  'mid_autotune', 'mid_reverb', 'mid_distortion', 'mid_delay', 'mid_chorus',
+  'side_autotune', 'side_reverb', 'side_distortion', 'side_delay', 'side_chorus',
+] as const;
 
 export class AudioEngine {
   private context: AudioContext;
@@ -44,6 +57,16 @@ export class AudioEngine {
   // Automation
   private activeRegions: EffectRegion[] = [];
   private automationInterval: any = null;
+  // Resolved param paths, cached after the engine comes up. The AudioWorklet
+  // wrapper's getParams() is a cheap cached list, but every setParam used to
+  // run includes()/find() over the whole path list — ~40 scans per
+  // updateSettings call and 20 per 15 ms automation tick. Resolving once
+  // cuts the main-thread string work to zero after init.
+  private paramPathCache: Map<string, string> = new Map();
+  // Last values actually posted to the worklet (dirty-set): steady-state
+  // playback re-sent the same 20 FX values every tick, and each postMessage
+  // is a structured clone plus a path lookup on the worklet thread.
+  private lastApplied: Map<string, number> = new Map();
   
   // Nodes
   private inputGain: GainNode;
@@ -168,6 +191,8 @@ export class AudioEngine {
         this.faustNode.connect(this.outputGain);
         
         this.isInitialized = true;
+        this.paramPathCache.clear();
+        this.lastApplied.clear();
         console.log("Faust Engine INITIALIZED SUCCESSFULLY");
         
         if (this.lastSettings) {
@@ -181,9 +206,12 @@ export class AudioEngine {
       console.error("Faust Initialization FAILED:", e);
       if (typeof window !== 'undefined') (window as any).faustError = e.message;
       this.reportError("FAUST ERROR:\n" + e.message);
-      // Failsafe: connect masterSwitch directly to outputGain so sound still works
+      // Failsafe: connect masterSwitch directly to outputGain so sound still works.
+      // isInitialized stays false on purpose: isReady() must reflect reality,
+      // otherwise the UI shows a fake "engine ready" while the DSP chain is a
+      // dead dry wire. Settings keep buffering into lastSettings (updateSettings)
+      // and are applied if/when the engine comes up.
       this.masterSwitch.connect(this.outputGain);
-      this.isInitialized = true;
     }
   }
 
@@ -195,27 +223,41 @@ export class AudioEngine {
     this.activeRegions = regions;
   }
 
+  /** Resolve a logical param name (e.g. "bass_reverb") to its DSP path, caching the hit. */
+  private resolveParamPath(name: string): string | null {
+    const cached = this.paramPathCache.get(name);
+    if (cached) return cached;
+    if (!this.faustNode) return null;
+    const params = this.faustNode.getParams();
+    const exactPath = `/mastering/${name}`;
+    const path = params.includes(exactPath)
+      ? exactPath
+      : params.find((p: string) => p.endsWith(`/${name}`) || p === name);
+    if (path) this.paramPathCache.set(name, path);
+    return path || null;
+  }
+
+  /**
+   * Push the params that actually changed to the worklet (dirty-set, see
+   * paramDiff.ts) through cached paths. No-op while the engine is dead.
+   */
+  private pushParams(values: Record<string, number>) {
+    if (!this.faustNode) return;
+    try {
+      applyChangedParams(this.lastApplied, values, (name, val) => {
+        const path = this.resolveParamPath(name);
+        if (path) this.faustNode.setParamValue(path, val);
+      });
+    } catch (e) {
+      console.warn('Failed to set Faust params', e);
+    }
+  }
+
   private startAutomation() {
     if (this.automationInterval) clearInterval(this.automationInterval);
     this.automationInterval = setInterval(() => {
       if (!this.isPlaying || !this.isInitialized || !this.faustNode || !this.lastSettings) return;
       const t = this.getCurrentTime();
-      
-      const setP = (name: string, val: number) => {
-        try {
-          if (this.faustNode) {
-            const params = this.faustNode.getParams();
-            const targetSuffix = `/${name}`;
-            const exactPath = `/mastering/${name}`;
-            if (params.includes(exactPath)) {
-              this.faustNode.setParamValue(exactPath, val);
-            } else {
-              const matchingParam = params.find((p: string) => p.endsWith(targetSuffix) || p === name);
-              if (matchingParam) this.faustNode.setParamValue(matchingParam, val);
-            }
-          }
-        } catch(e) {}
-      };
 
       const activeRegions = this.activeRegions.filter(r => t >= r.start && t <= r.end);
       const stems: ('master' | 'bass' | 'mid' | 'side')[] = ['master', 'bass', 'mid', 'side'];
@@ -223,22 +265,19 @@ export class AudioEngine {
       stems.forEach(stem => {
         const region = activeRegions.find(r => r.targetStem === stem);
         const prefix = stem === 'master' ? '' : `${stem}_`;
-        
-        if (region) {
-          setP(`${prefix}autotune`, region.effects.autotune || 0);
-          setP(`${prefix}reverb`, region.effects.reverb || 0);
-          setP(`${prefix}distortion`, region.effects.distortion || 0);
-          setP(`${prefix}delay`, region.effects.delay || 0);
-          setP(`${prefix}chorus`, region.effects.chorus || 0);
-        } else {
-          setP(`${prefix}autotune`, (this.lastSettings as any)[`${prefix}autotune`] || 0);
-          setP(`${prefix}reverb`, (this.lastSettings as any)[`${prefix}reverb`] || 0);
-          setP(`${prefix}distortion`, (this.lastSettings as any)[`${prefix}distortion`] || 0);
-          setP(`${prefix}delay`, (this.lastSettings as any)[`${prefix}delay`] || 0);
-          setP(`${prefix}chorus`, (this.lastSettings as any)[`${prefix}chorus`] || 0);
-        }
+        const fx = (n: string): number =>
+          region ? (region.effects as any)[n] || 0 : (this.lastSettings as any)[`${prefix}${n}`] || 0;
+        // pushParams is a no-op for unchanged values, so steady playback
+        // posts nothing; region boundaries still update within one tick.
+        this.pushParams({
+          [`${prefix}autotune`]: fx('autotune'),
+          [`${prefix}reverb`]: fx('reverb'),
+          [`${prefix}distortion`]: fx('distortion'),
+          [`${prefix}delay`]: fx('delay'),
+          [`${prefix}chorus`]: fx('chorus'),
+        });
       });
-    }, 15);
+    }, 25); // was 15 ms: region values are constant within a window, 40 Hz is indistinguishable
   }
 
   private stopAutomation() {
@@ -454,79 +493,22 @@ export class AudioEngine {
     this.lastSettings = settings;
     if (!this.faustNode || !this.isInitialized) return;
 
-    const setParam = (name: string, val: number) => {
-      try {
-        if (this.faustNode) {
-          const params = this.faustNode.getParams();
-          const targetSuffix = `/${name}`;
-          const exactPath = `/mastering/${name}`;
-          
-          if (params.includes(exactPath)) {
-            this.faustNode.setParamValue(exactPath, val);
-          } else {
-            // Find any param that ends with the requested name
-            const matchingParam = params.find((p: string) => p.endsWith(targetSuffix) || p === name);
-            if (matchingParam) {
-              this.faustNode.setParamValue(matchingParam, val);
-            } else {
-             // console.warn(`Faust param not found: ${name}`);
-            }
-          }
-        }
-      } catch (e) {
-        console.warn(`Failed to set Faust param: ${name}`, e);
-      }
-    };
-
-    setParam("gain", settings.gain);
-    setParam("lowShelf", settings.lowShelf);
-    setParam("midRange", settings.midRange);
-    setParam("highShelf", settings.highShelf);
-    setParam("compression", settings.compression);
-    setParam("limiter", settings.limiter);
-    setParam("saturation", settings.saturation);
-    setParam("exciterAmount", settings.exciterAmount);
-    setParam("exciterFreq", settings.exciterFreq);
-    setParam("haasAmount", settings.haasAmount);
-    setParam("stereoWidth", settings.stereoWidth);
-    setParam("fundamentalFreq", settings.fundamentalFreq);
-    setParam("eq31", settings.eq31);
-    setParam("eq62", settings.eq62);
-    setParam("eq125", settings.eq125);
-    setParam("eq250", settings.eq250);
-    setParam("eq500", settings.eq500);
-    setParam("eq1k", settings.eq1k);
-    setParam("eq2k", settings.eq2k);
-    setParam("eq4k", settings.eq4k);
-    setParam("eq8k", settings.eq8k);
-    setParam("eq16k", settings.eq16k);
-    setParam("autotune", settings.autotune);
-    setParam("reverb", settings.reverb);
-    setParam("distortion", settings.distortion);
-    setParam("delay", settings.delay);
-    setParam("chorus", settings.chorus);
-
-    setParam("bass_autotune", settings.bass_autotune);
-    setParam("bass_reverb", settings.bass_reverb);
-    setParam("bass_distortion", settings.bass_distortion);
-    setParam("bass_delay", settings.bass_delay);
-    setParam("bass_chorus", settings.bass_chorus);
-
-    setParam("mid_autotune", settings.mid_autotune);
-    setParam("mid_reverb", settings.mid_reverb);
-    setParam("mid_distortion", settings.mid_distortion);
-    setParam("mid_delay", settings.mid_delay);
-    setParam("mid_chorus", settings.mid_chorus);
-
-    setParam("side_autotune", settings.side_autotune);
-    setParam("side_reverb", settings.side_reverb);
-    setParam("side_distortion", settings.side_distortion);
-    setParam("side_delay", settings.side_delay);
-    setParam("side_chorus", settings.side_chorus);
+    // Cached paths + dirty-set: only the params that actually changed are
+    // posted (see paramDiff), so a slider drag costs one postMessage.
+    const s = settings as unknown as Record<string, number>;
+    const values: Record<string, number> = {};
+    for (const name of SETTING_PARAM_NAMES) values[name] = s[name];
+    this.pushParams(values);
   }
 
+  // Cached identity: callers use this object in React effect deps (MeteringBridge)
+  // and as a component prop (visualizer). A fresh object per call made those
+  // effects re-run on every App re-render (~10 Hz), recreating the LoudnessMeter
+  // mid-stream — the LUFS meters "drifted"/showed −∞.
+  private analysersCache: { L: AnalyserNode; R: AnalyserNode } | null = null;
   public getAnalysers() {
-    return { L: this.analyserL, R: this.analyserR };
+    if (!this.analysersCache) this.analysersCache = { L: this.analyserL, R: this.analyserR };
+    return this.analysersCache;
   }
 
   /**
