@@ -53,6 +53,63 @@ side_distortionAmt = ui(hslider("side_distortion", 0, 0, 100, 0.1));
 side_delayAmt = ui(hslider("side_delay", 0, 0, 100, 0.1));
 side_chorusAmt = ui(hslider("side_chorus", 0, 0, 100, 0.1));
 
+// Parametric EQ parameters (4 bands)
+// type: 0 = peak, 1 = low shelf, 2 = high shelf
+// freq slider 0..100 maps logarithmically to 20 Hz .. 20 kHz
+peq1Freq = ui(hslider("peq1Freq", 15, 0, 100, 0.1));
+peq1Q = ui(hslider("peq1Q", 1, 0.1, 10, 0.1));
+peq1Gain = ui(hslider("peq1Gain", 0, -12, 12, 0.01));
+peq1Type = ui(hslider("peq1Type", 0, 0, 2, 1));
+peq2Freq = ui(hslider("peq2Freq", 40, 0, 100, 0.1));
+peq2Q = ui(hslider("peq2Q", 1, 0.1, 10, 0.1));
+peq2Gain = ui(hslider("peq2Gain", 0, -12, 12, 0.01));
+peq2Type = ui(hslider("peq2Type", 0, 0, 2, 1));
+peq3Freq = ui(hslider("peq3Freq", 65, 0, 100, 0.1));
+peq3Q = ui(hslider("peq3Q", 1, 0.1, 10, 0.1));
+peq3Gain = ui(hslider("peq3Gain", 0, -12, 12, 0.01));
+peq3Type = ui(hslider("peq3Type", 0, 0, 2, 1));
+peq4Freq = ui(hslider("peq4Freq", 85, 0, 100, 0.1));
+peq4Q = ui(hslider("peq4Q", 1, 0.1, 10, 0.1));
+peq4Gain = ui(hslider("peq4Gain", 0, -12, 12, 0.01));
+peq4Type = ui(hslider("peq4Type", 0, 0, 2, 1));
+
+// Widener / MONO (stereo image, after ms_wid)
+widenerAmt = ui(hslider("widenerAmt", 0, 0, 100, 0.1));
+mono = ui(hslider("mono", 0, 0, 1, 1));
+
+// Bus compressor (glue, after multiband)
+compAmt = ui(hslider("compAmt", 0, 0, 100, 0.1));
+compThresh = ui(hslider("compThresh", -18, -40, 0, 0.5));
+compRatio = ui(hslider("compRatio", 3, 1, 20, 0.1));
+compAttack = ui(hslider("compAttack", 10, 1, 100, 1));
+compRelease = ui(hslider("compRelease", 150, 30, 500, 1));
+
+// Noise gate (opens instantly, closes with one-pole release)
+gateAmt = ui(hslider("gateAmt", 0, 0, 100, 0.1));
+gateThresh = ui(hslider("gateThresh", -48, -60, 0, 0.5));
+gateRelease = ui(hslider("gateRelease", 100, 20, 500, 1));
+
+// Transient shaper (fast/slow split)
+transAmt = ui(hslider("transAmt", 0, -100, 100, 0.1));
+transFreq = ui(hslider("transFreq", 250, 50, 1000, 1));
+
+// De-esser / tape / air
+deessAmt = ui(hslider("deessAmt", 0, 0, 100, 0.1));
+deessFreq = ui(hslider("deessFreq", 6000, 4000, 9000, 50));
+tapeAmt = ui(hslider("tapeAmt", 0, 0, 100, 0.1));
+tapeTone = ui(hslider("tapeTone", 6000, 1000, 12000, 50));
+airAmt = ui(hslider("airAmt", 0, 0, 100, 0.1));
+airFreq = ui(hslider("airFreq", 8000, 5000, 12000, 50));
+
+// Mod FX (phaser / flanger / tremolo)
+phaserAmt = ui(hslider("phaserAmt", 0, 0, 100, 0.1));
+flangerAmt = ui(hslider("flangerAmt", 0, 0, 100, 0.1));
+tremoloAmt = ui(hslider("tremoloAmt", 0, 0, 100, 0.1));
+
+// Bitcrusher
+bitDepth = ui(hslider("bitDepth", 16, 4, 16, 1));
+srHold = ui(hslider("srHold", 1, 1, 20, 1));
+
 // --- 1. EQ SECTION ---
 graphic_eq = fi.peak_eq(eq31, 31, 31/1.414)
            : fi.peak_eq(eq62, 62, 62/1.414)
@@ -65,11 +122,155 @@ graphic_eq = fi.peak_eq(eq31, 31, 31/1.414)
            : fi.peak_eq(eq8k, 8000, 8000/1.414)
            : fi.peak_eq(eq16k, 16000, 16000/1.414);
 
-eq_stage = fi.low_shelf(lowShelf, 150) 
-         : fi.peak_eq(midRange, 1000, 1000/1.0) 
+eq_stage = fi.low_shelf(lowShelf, 150)
+         : fi.peak_eq(midRange, 1000, 1000/1.0)
          : fi.high_shelf(highShelf, 5000)
          : fi.peak_eq(3.0, fundamentalFreq, fundamentalFreq/8.0)
          : graphic_eq;
+
+// --- 1b. PARAMETRIC EQ (4 bands: peak / low shelf / high shelf) ---
+// Type switch uses smooth arithmetic weights (no select2/ba.if — see haas_node
+// comment). At gain=0 every band is a pure bypass.
+peq1(x) = (x : fi.peak_eq_cq(peq1Gain, peq1_hz, peq1Q) * peq1_wp)
+         + (x : fi.low_shelf(peq1Gain, peq1_hz) * peq1_wn)
+         + (x : fi.high_shelf(peq1Gain, peq1_hz) * peq1_wh)
+with {
+    peq1_hz = 20.0 * pow(10.0, 3.0 * (peq1Freq / 100.0));
+    peq1_wp = 1.0 - min(1.0, max(0.0, (peq1Type - 0.5) * 10.0));
+    peq1_wn = min(1.0, max(0.0, (peq1Type - 0.5) * 10.0)) * (1.0 - min(1.0, max(0.0, (peq1Type - 1.5) * 10.0)));
+    peq1_wh = min(1.0, max(0.0, (peq1Type - 1.5) * 10.0));
+};
+
+peq2(x) = (x : fi.peak_eq_cq(peq2Gain, peq2_hz, peq2Q) * peq2_wp)
+         + (x : fi.low_shelf(peq2Gain, peq2_hz) * peq2_wn)
+         + (x : fi.high_shelf(peq2Gain, peq2_hz) * peq2_wh)
+with {
+    peq2_hz = 20.0 * pow(10.0, 3.0 * (peq2Freq / 100.0));
+    peq2_wp = 1.0 - min(1.0, max(0.0, (peq2Type - 0.5) * 10.0));
+    peq2_wn = min(1.0, max(0.0, (peq2Type - 0.5) * 10.0)) * (1.0 - min(1.0, max(0.0, (peq2Type - 1.5) * 10.0)));
+    peq2_wh = min(1.0, max(0.0, (peq2Type - 1.5) * 10.0));
+};
+
+peq3(x) = (x : fi.peak_eq_cq(peq3Gain, peq3_hz, peq3Q) * peq3_wp)
+         + (x : fi.low_shelf(peq3Gain, peq3_hz) * peq3_wn)
+         + (x : fi.high_shelf(peq3Gain, peq3_hz) * peq3_wh)
+with {
+    peq3_hz = 20.0 * pow(10.0, 3.0 * (peq3Freq / 100.0));
+    peq3_wp = 1.0 - min(1.0, max(0.0, (peq3Type - 0.5) * 10.0));
+    peq3_wn = min(1.0, max(0.0, (peq3Type - 0.5) * 10.0)) * (1.0 - min(1.0, max(0.0, (peq3Type - 1.5) * 10.0)));
+    peq3_wh = min(1.0, max(0.0, (peq3Type - 1.5) * 10.0));
+};
+
+peq4(x) = (x : fi.peak_eq_cq(peq4Gain, peq4_hz, peq4Q) * peq4_wp)
+         + (x : fi.low_shelf(peq4Gain, peq4_hz) * peq4_wn)
+         + (x : fi.high_shelf(peq4Gain, peq4_hz) * peq4_wh)
+with {
+    peq4_hz = 20.0 * pow(10.0, 3.0 * (peq4Freq / 100.0));
+    peq4_wp = 1.0 - min(1.0, max(0.0, (peq4Type - 0.5) * 10.0));
+    peq4_wn = min(1.0, max(0.0, (peq4Type - 0.5) * 10.0)) * (1.0 - min(1.0, max(0.0, (peq4Type - 1.5) * 10.0)));
+    peq4_wh = min(1.0, max(0.0, (peq4Type - 1.5) * 10.0));
+};
+
+peq_chain = peq1 : peq2 : peq3 : peq4;
+
+// --- 1c. NOISE GATE (before compression: cuts silence, not dynamics) ---
+// Attack 2 ms, release = gateRelease ms (stdlib one-pole switching; the
+// faustwasm 0.16.1 compiler miscompiles hand-written self-referencing
+// with-blocks — "endless evaluation cycle" — so no manual follower here).
+lin2db(x) = ba.linear2db(x);
+gate_node(x) = x * g
+with {
+    env_db = x : an.amp_follower_ar(0.002, gateRelease / 1000.0) : lin2db;
+    s = (env_db - gateThresh) : max(0) : min(1);
+    g = 1.0 - (gateAmt / 100.0) * (1.0 - s);
+};
+
+// --- 1c2. DE-ESSER (ducks only the sibilance band; def amt=0 -> x) ---
+deess_node(x) = x - sib * duck
+with {
+    sib = x : fi.bandpass(2, deessFreq * 0.83, deessFreq * 1.17);
+    env = sib : an.rms_envelope_rect(0.02) : max(0) : min(1.0);
+    duck = env * (deessAmt / 100.0);
+};
+
+// --- 1d. TRANSIENT SHAPER (fast/slow split, amplitude-dependent) ---
+trans_node(x) = slow + fast * (1.0 + t * env)
+with {
+    t = transAmt / 100.0;
+    slow = x : fi.lowpass(1, transFreq);
+    fast = x - slow;
+    env = x : an.rms_envelope_rect(0.01) : max(0) : min(1.0);
+};
+
+// --- 1e. BUS COMPRESSOR (glue; wet/dry, def amt=0 -> dry) ---
+bus_comp(x) = (x * (1.0 - a)) + (x : co.compressor_mono(compRatio, compThresh, compAtk_s, compRel_s))
+with {
+    a = compAmt / 100.0;
+    compAtk_s = compAttack / 1000.0;
+    compRel_s = compRelease / 1000.0;
+};
+
+// --- 1f. TAPE SATURATION (tanh drive + "tape" lowpass; def amt=0 -> x) ---
+tape_node(x) = x * (1.0 - a) + (x : tape_sat) * a
+with { a = tapeAmt / 100.0; };
+tape_sat(y) = y : fi.lowpass(2, tapeTone) : ma.tanh : *(3.0) : *(1.0/1.5);
+
+// --- 4a. MOD FX (creative; all def amt=0 -> x; LFOs start phase-locked) ---
+// PHASER — 4 allpass stages, delay LFO 1.5..5 ms @ 0.25 Hz
+phaser_node(x) = x * (1.0 - w) + (x : ap : ap : ap : ap) * w
+with {
+    w = phaserAmt / 100.0 * 0.7;
+    d = (0.0015 + 0.0035 * (os.osc(0.25) * 0.5 + 0.5)) * ma.SR;
+    ap = fi.allpass_comb((ma.SR / 100.0) * 8, d, 0.6);
+};
+
+// FLANGER — modulated delay 1..10 ms @ 0.3 Hz + feedback 0.5.
+// Feedback uses the stdlib-verified `loop ~ _` idiom (onePoleSwitching shape):
+// yState is the previous sample of the result. The faustwasm 0.16.1 compiler
+// miscompiles hand-written self-referencing with-blocks, so no `y with {...}`.
+flanger_node(x) = x * (1.0 - w) + flange_fb * w
+with {
+    w = flangerAmt / 100.0 * 0.5;
+    flange_fb = loop ~ _
+    with {
+        loop(yState) = (yState : fd) : *(0.5) + x : fd
+        with {
+            fd = de.fdelay((ma.SR / 100.0) * 6, d);
+            d = (0.001 + 0.009 * (os.osc(0.3) * 0.5 + 0.5)) * ma.SR;
+        };
+    };
+};
+
+// TREMOLO — AM 4 Hz, depth up to 85%
+tremolo_node(x) = x * (1.0 - a * 0.85 + a * 0.85 * (os.osc(4.0) * 0.5 + 0.5))
+with { a = tremoloAmt / 100.0; };
+
+// --- 4a2. AIR EXCITER (hp -> tanh -> blend; def amt=0 -> x) ---
+air_node(x) = x + (x : fi.highpass(2, airFreq) : ma.tanh : *(a * 0.5))
+with { a = airAmt / 100.0 : max(0); };
+
+// --- 4c. BITCRUSHER (quantization + sample-and-hold; def 16 bit / hold=1
+// = 16-bit quantization only, deviation <= 1.5e-5, inaudible) ---
+// `loop ~ _` idiom (faustwasm 0.16.1 miscompiles hand-written
+// self-referencing with-blocks — see flanger_node comment).
+crush_node(x) = hold
+with {
+    q = pow(2.0, bitDepth - 1.0);
+    k = 1.0 / srHold;
+    qround = x : *(q) : round : *(1.0/q);
+    hold = loop ~ _
+    with {
+        loop(yState) = k * qround + (1.0 - k) * yState;
+    };
+};
+
+// --- 4b. WIDENER + MONO (stereo 2-in/2-out; def: s*(1+0)*(1-0) = s) ---
+wid_mono(l_in, r_in) = (m + s_out), (m - s_out)
+with {
+    m = (l_in + r_in) * 0.5;
+    s = (l_in - r_in) * 0.5;
+    s_out = s * (1.0 + widenerAmt / 100.0) * (1.0 - mono);
+};
 
 // --- 2. TEXTURE SECTION ---
 dist(x) = ma.tanh(x * (1.0 + drv)) / (1.0 + drv * 0.5) with { drv = (saturationAmt / 10.0) * 4.0 : max(0); };
@@ -147,13 +348,25 @@ with {
 };
 
 // --- MAIN PROCESSING CHAIN ---
-process = 
-    par(i, 2, *(gain)) 
+process =
+    par(i, 2, *(gain))
     : par(i, 2, eq_stage)
+    : par(i, 2, gate_node)
+    : par(i, 2, deess_node)
+    : par(i, 2, peq_chain)
     : stem_crossover
     : fx_master
-    : par(i, 2, dist : excite) 
-    : par(i, 2, mb_comp) 
-    : haas_node 
-    : ms_wid 
+    : par(i, 2, trans_node)
+    : par(i, 2, dist : excite)
+    : par(i, 2, mb_comp)
+    : par(i, 2, bus_comp)
+    : par(i, 2, tape_node)
+    : haas_node
+    : par(i, 2, phaser_node)
+    : par(i, 2, flanger_node)
+    : par(i, 2, tremolo_node)
+    : ms_wid
+    : wid_mono
+    : par(i, 2, air_node)
+    : par(i, 2, crush_node)
     : par(i, 2, limit_node);

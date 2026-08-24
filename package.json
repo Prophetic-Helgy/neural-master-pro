@@ -1,10 +1,10 @@
 {
   "name": "neural-master-pro",
-  "productName": "Neural Master Pro 2.2",
+  "productName": "Neural Master Pro 2.4",
   "description": "Premium AI-powered audio mastering application with real-time Faust DSP engine.",
   "author": "Oleg",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.4.0",
   "type": "module",
   "main": "main.cjs",
   "scripts": {

@@ -181,6 +181,14 @@ async function installPageHelpers(page) {
       if (!p) return { err: `param not found: ${name}` };
       return { path: p, value: fn.getParamValue(p) };
     };
+    /** Parametric EQ band control by data-testid (kind: type/gain/freq/q). */
+    const peqSet = (band, kind, value) => {
+      const el = document.querySelector(`[data-testid="peq${band}-${kind}"]`);
+      if (!el) return { ok: false, err: `PEQ control not found: peq${band}-${kind}` };
+      if (el.disabled) return { ok: false, err: `PEQ control disabled: peq${band}-${kind}` };
+      inputSet(el, value);
+      return { ok: true, ui: parseFloat(el.value) };
+    };
     const setRangeByMinMax = (min, max, value) => {
       const r = document.querySelector(`input[type="range"][min="${min}"][max="${max}"]`);
       if (!r || r.disabled) return false;
@@ -199,7 +207,7 @@ async function installPageHelpers(page) {
       const span = document.querySelector('div.space-y-1 span');
       return span ? span.textContent : '';
     };
-    window.__h = { inputSet, setTonalSlider, setFxSlider, eqSetBand, clickText, clickTextStart, clickLiteMaster, dspParam, setRangeByMinMax, seekBar, getSeekBarLabel };
+    window.__h = { inputSet, setTonalSlider, setFxSlider, eqSetBand, clickText, clickTextStart, clickLiteMaster, dspParam, peqSet, setRangeByMinMax, seekBar, getSeekBarLabel };
   });
 }
 
@@ -424,11 +432,13 @@ async function awaitDownload(page, ms = 120000) {
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const TONE = path.join(OUT_DIR, 'e2e_tone.wav');
   const REFTONE = path.join(OUT_DIR, 'e2e_ref.wav');
+  const HIGHTONE = path.join(OUT_DIR, 'e2e_hightone.wav');
   const B1 = path.join(OUT_DIR, 'e2e_batch1.wav');
   const B2 = path.join(OUT_DIR, 'e2e_batch2.wav');
   const B3 = path.join(OUT_DIR, 'e2e_batch3.wav');
   writeToneWav(TONE, [110, 220, 440], 10);
   writeToneWav(REFTONE, [330, 660, 990], 10);
+  writeToneWav(HIGHTONE, [4400, 8800, 12000], 10);
   writeToneWav(B1, [100], 3);
   writeToneWav(B2, [200], 3);
   writeToneWav(B3, [300], 3);
@@ -516,6 +526,28 @@ async function awaitDownload(page, ms = 120000) {
       ['Exciter', 'exciterAmount', 5],
       ['Haas Doubling', 'haasAmount', 50],
       ['Stereo Field', 'stereoWidth', 30],
+      ['Comp Amount', 'compAmt', 60],
+      ['Comp Threshold', 'compThresh', -18],
+      ['Comp Ratio', 'compRatio', 4],
+      ['Comp Attack', 'compAttack', 20],
+      ['Comp Release', 'compRelease', 200],
+      ['Gate Amount', 'gateAmt', 80],
+      ['Gate Threshold', 'gateThresh', -40],
+      ['Gate Release', 'gateRelease', 150],
+      ['Trans Amount', 'transAmt', 50],
+      ['Trans Freq', 'transFreq', 400],
+      ['Widener', 'widenerAmt', 80],
+      ['Tape Amount', 'tapeAmt', 50],
+      ['Tape Tone', 'tapeTone', 8000],
+      ['Air Amount', 'airAmt', 50],
+      ['Air Freq', 'airFreq', 10000],
+      ['DeEss Amount', 'deessAmt', 50],
+      ['DeEss Freq', 'deessFreq', 7000],
+      ['Phaser', 'phaserAmt', 50],
+      ['Flanger', 'flangerAmt', 50],
+      ['Tremolo', 'tremoloAmt', 50],
+      ['Bit Depth', 'bitDepth', 12],
+      ['SR Hold', 'srHold', 5],
     ];
     for (const [label, name, target] of sliders) {
       const r = await h(page, 'setTonalSlider', label, target);
@@ -525,6 +557,40 @@ async function awaitDownload(page, ms = 120000) {
       const pOk = p && !p.err && typeof p.value === 'number' && Math.abs(p.value - target) < 0.01;
       check(`${label} -> DSP ${name}`, r.ok && uiOk && pOk, r.ok ? `ui=${r.ui}, dsp=${p && p.value}` : r.err);
     }
+  }
+
+  // =========================================================================
+  section('M1.2b — Parametric EQ: 4 bands x (gain/freq/Q/type) -> live DSP');
+  // =========================================================================
+  {
+    // gain/freq/q before type: the Q slider is disabled once type != 0 (peak).
+    const cases = [
+      [1, 'gain', 'peq1Gain', 6], [1, 'freq', 'peq1Freq', 35], [1, 'q', 'peq1Q', 3], [1, 'type', 'peq1Type', 1],
+      [2, 'gain', 'peq2Gain', -4], [2, 'freq', 'peq2Freq', 60], [2, 'q', 'peq2Q', 2], [2, 'type', 'peq2Type', 2],
+      [3, 'gain', 'peq3Gain', 8], [3, 'freq', 'peq3Freq', 80], [3, 'q', 'peq3Q', 5], [3, 'type', 'peq3Type', 1],
+      [4, 'gain', 'peq4Gain', -6], [4, 'freq', 'peq4Freq', 95], [4, 'q', 'peq4Q', 1], [4, 'type', 'peq4Type', 2],
+    ];
+    for (const [band, kind, name, target] of cases) {
+      const r = await h(page, 'peqSet', band, kind, target);
+      await sleep(200);
+      const p = await h(page, 'dspParam', name);
+      const pOk = p && !p.err && typeof p.value === 'number' && Math.abs(p.value - target) < 0.01;
+      check(`PEQ band${band} ${kind} -> DSP ${name}`, r.ok && pOk, r.ok ? `ui=${r.ui}, dsp=${p && p.value}` : r.err);
+    }
+  }
+
+  // =========================================================================
+  section('M1.2c — MONO button: toggle collapses/widens the side channel');
+  // =========================================================================
+  {
+    const on = await h(page, 'clickText', 'Mono');
+    await sleep(250);
+    const pOn = await h(page, 'dspParam', 'mono');
+    check('MONO on -> DSP mono=1', on && pOn && !pOn.err && pOn.value === 1, `dsp=${pOn && pOn.value}`);
+    const off = await h(page, 'clickText', 'Mono');
+    await sleep(250);
+    const pOff = await h(page, 'dspParam', 'mono');
+    check('MONO off -> DSP mono=0', off && pOff && !pOff.err && pOff.value === 0, `dsp=${pOff && pOff.value}`);
   }
 
   // =========================================================================
@@ -622,6 +688,9 @@ async function awaitDownload(page, ms = 120000) {
         ['side_autotune', 70], ['side_reverb', 80], ['side_distortion', 60], ['side_delay', 50], ['side_chorus', 45],
         ['eq31', 4], ['eq62', -3], ['eq125', 4], ['eq250', -2], ['eq500', 3],
         ['eq1k', -4], ['eq2k', 2], ['eq4k', -3], ['eq8k', 4], ['eq16k', -2],
+        ['widenerAmt', 80], ['mono', 1], ['compAmt', 60], ['transAmt', 50],
+        ['tapeAmt', 60], ['phaserAmt', 60], ['flangerAmt', 60], ['tremoloAmt', 60],
+        ['bitDepth', 10], ['srHold', 5],
       ];
       const base = await e.renderProPcm({ ...neutral }, 0, 0, []);
       if (!base) return { err: 'baseline render failed' };
@@ -654,17 +723,133 @@ async function awaitDownload(page, ms = 120000) {
       } else {
         out.limiter = -1;
       }
+      // PEQ: pair-diff (two renders) — the 110/220/440 Hz test chord sits far from the
+      // default band centers (56/316/1778/7079 Hz), so each band is first placed ON the
+      // chord (freq 35 ≈ 224 Hz) and a second param is varied against that placement.
+      const pair = async (name, base2, delta) => {
+        const a = await e.renderProPcm(base2, 0, 0, []);
+        const b = await e.renderProPcm({ ...base2, ...delta }, 0, 0, []);
+        if (!a || !b) { out[name] = -1; return; }
+        const N = a.left.length;
+        let maxd = 0;
+        for (let i = 0; i < N; i += 16) {
+          maxd = Math.max(maxd, Math.abs(a.left[i] - b.left[i]) + Math.abs(a.right[i] - b.right[i]));
+        }
+        out[name] = maxd;
+      };
+      const pb = { ...neutral, peq1Freq: 35 };
+      await pair('peq1Gain', { ...pb, peq1Gain: 0 }, { peq1Gain: 8 });
+      await pair('peq1Freq', { ...pb, peq1Gain: 8 }, { peq1Freq: 25 });
+      await pair('peq1Q', { ...pb, peq1Gain: 8, peq1Q: 2 }, { peq1Q: 8 });
+      await pair('peq1Type', { ...pb, peq1Gain: 8, peq1Type: 0 }, { peq1Type: 1 });
+      await pair('peq2Gain', { ...neutral, peq2Freq: 35, peq2Gain: 0 }, { peq2Gain: 8 });
+      await pair('peq3Gain', { ...neutral, peq3Freq: 35, peq3Gain: 0 }, { peq3Gain: 8 });
+      await pair('peq4Gain', { ...neutral, peq4Freq: 35, peq4Gain: 0 }, { peq4Gain: 8 });
+      // Compressor: at amt=60 the -8 dBFS peaks of the tone exceed the threshold,
+      // so each control must shift gain reduction.
+      await pair('compThresh', { ...neutral, compAmt: 60, compThresh: -18 }, { compThresh: -5 });
+      await pair('compRatio', { ...neutral, compAmt: 60, compThresh: -18 }, { compRatio: 12 });
+      await pair('compAttack', { ...neutral, compAmt: 60, compThresh: -18, compAttack: 1 }, { compAttack: 100 });
+      await pair('compRelease', { ...neutral, compAmt: 60, compThresh: -18, compRelease: 30 }, { compRelease: 500 });
+      // Gate: the tone body (RMS ~ -12.6 dBFS) sits above -4 dBFS, so the gate stays
+      // open mid-tone but closes on the 0.5 s fade-in / 1.5 s fade-out ramps.
+      await pair('gateAmt', { ...neutral, gateThresh: -4 }, { gateAmt: 100 });
+      await pair('gateThresh', { ...neutral, gateAmt: 100, gateThresh: -48 }, { gateThresh: -4 });
+      // thresh -12 < body level (-8 peak): gate open mid-tone, closes during the
+      // 1.5 s fade-out; release time-constant (200 vs 500 ms) shifts the close.
+      await pair('gateRelease', { ...neutral, gateAmt: 100, gateThresh: -12, gateRelease: 200 }, { gateRelease: 500 });
+      // Transient shaper: move the fast/slow split across the 110/220/440 Hz chord.
+      await pair('transFreq', { ...neutral, transAmt: 50, transFreq: 250 }, { transFreq: 800 });
       return out;
     });
     if (results.err) {
       check('DSP render baseline', false, results.err);
     } else {
       const dead = Object.entries(results).filter(([, d]) => d < 1e-4);
-      check('all 41 DSP params change the render', dead.length === 0,
+      check('all 66 DSP param checks change the render', dead.length === 0,
         dead.length ? `DEAD: ${dead.map(([n, d]) => `${n}(${d.toFixed(6)})`).join(', ')}` : 'min diff ok');
       const weakest = Object.entries(results).sort((a, b) => a[1] - b[1]).slice(0, 3);
       console.log(`  (weakest: ${weakest.map(([n, d]) => `${n}=${d.toExponential(2)}`).join(', ')})`);
     }
+  }
+
+  // =========================================================================
+  section('M1.5b — High-tone regression: de-esser / air exciter on 4.4/8.8/12 kHz');
+  // =========================================================================
+  {
+    // The low chord has no sibilance/air-band energy, so deess/air params only
+    // prove alive against the high-tone fixture. Upload it, render pairs, then
+    // restore TONE (invariant for the modules that follow).
+    // Load detection: in-page DFT at 8800 Hz. 8800 Hz x 10 s = 88000 whole
+    // periods -> the bin is ~30k on HIGHTONE and ~0 on TONE (110/220/440 Hz are
+    // all integer-multiple orthogonal frequencies).
+    const dft8800 = () => page.evaluate(() => {
+      const b = window.__NMP__.getEngine().buffer;
+      if (!b) return -1;
+      const d = b.getChannelData(0);
+      const sr = b.sampleRate;
+      let s = 0;
+      for (let i = 0; i < d.length; i += 1) s += d[i] * Math.sin(2 * Math.PI * 8800 * i / sr);
+      return Math.abs(s);
+    });
+    const up2 = await page.$('#track-upload');
+    await up2.uploadFile(HIGHTONE);
+    const hiUp = await waitFor(page, () => {
+      const b = window.__NMP__.getEngine().buffer;
+      if (!b) return false;
+      const d = b.getChannelData(0);
+      const sr = b.sampleRate;
+      let s = 0;
+      for (let i = 0; i < d.length; i += 1) s += d[i] * Math.sin(2 * Math.PI * 8800 * i / sr);
+      return Math.abs(s) > 1000;
+    }, 30000, 500);
+    check('high-tone fixture loaded (8800 Hz DFT > 1000)', hiUp, `dft=${await dft8800()}`);
+
+    const hi = await page.evaluate(async () => {
+      const e = window.__NMP__.getEngine();
+      const neutral = window.__NMP__.getNeutralSettings();
+      const pair = async (name, base2, delta) => {
+        const a = await e.renderProPcm(base2, 0, 0, []);
+        const b = await e.renderProPcm({ ...base2, ...delta }, 0, 0, []);
+        if (!a || !b) return -1;
+        const N = a.left.length;
+        let maxd = 0;
+        for (let i = 0; i < N; i += 16) {
+          maxd = Math.max(maxd, Math.abs(a.left[i] - b.left[i]) + Math.abs(a.right[i] - b.right[i]));
+        }
+        return maxd;
+      };
+      const out = {};
+      // Sibilance band on the 8.8 kHz partial: band at 8000 Hz spans 6.6-9.4 kHz.
+      out.deessAmt = await pair('deessAmt', { ...neutral, deessFreq: 8000, deessAmt: 0 }, { deessAmt: 100 });
+      // Band center 6000 (4.98-7.02 kHz, off-chord) vs 8000 (on the 8.8 kHz partial).
+      out.deessFreq = await pair('deessFreq', { ...neutral, deessAmt: 100, deessFreq: 6000 }, { deessFreq: 8000 });
+      // Air band: hp at 8 kHz feeds 8.8/12 kHz; amount 0 vs 100.
+      out.airAmt = await pair('airAmt', { ...neutral, airFreq: 8000, airAmt: 0 }, { airAmt: 100 });
+      // hp 6 kHz (8.8+12 kHz) vs 10 kHz (mostly 12 kHz only) at full amount.
+      out.airFreq = await pair('airFreq', { ...neutral, airAmt: 100, airFreq: 6000 }, { airFreq: 10000 });
+      // Tape lowpass 10 kHz (8.8/12 kHz pass) vs 2 kHz (cuts both) at amt=60.
+      out.tapeTone = await pair('tapeTone', { ...neutral, tapeAmt: 60, tapeTone: 10000 }, { tapeTone: 2000 });
+      // PEQ band 4 at gain 6: 88 -> ~8.73 kHz (on the 8.8 kHz partial) vs 80 -> ~5 kHz.
+      out.peq4Freq = await pair('peq4Freq', { ...neutral, peq4Gain: 6, peq4Freq: 88 }, { peq4Freq: 80 });
+      return out;
+    });
+    const deadHi = Object.entries(hi).filter(([, d]) => d < 1e-4);
+    check('all 6 high-tone DSP param checks change the render', deadHi.length === 0,
+      deadHi.length ? `DEAD: ${deadHi.map(([n, d]) => `${n}(${d.toFixed(6)})`).join(', ')}` : 'min diff ok');
+
+    // Restore TONE for the modules that follow.
+    await up2.uploadFile(TONE);
+    const restored = await waitFor(page, () => {
+      const b = window.__NMP__.getEngine().buffer;
+      if (!b) return false;
+      const d = b.getChannelData(0);
+      const sr = b.sampleRate;
+      let s = 0;
+      for (let i = 0; i < d.length; i += 1) s += d[i] * Math.sin(2 * Math.PI * 8800 * i / sr);
+      return Math.abs(s) < 1;
+    }, 30000, 500);
+    check('tone fixture restored (8800 Hz DFT ~ 0)', restored);
   }
 
   // =========================================================================

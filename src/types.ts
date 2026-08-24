@@ -86,6 +86,46 @@ export interface MasteringSettings {
   side_distortion: number;
   side_delay: number;
   side_chorus: number;
+  // Parametric EQ (4 bands; freq 0..100 log-scaled 20Hz..20kHz, type 0/1/2)
+  peq1Freq: number;
+  peq1Q: number;
+  peq1Gain: number;
+  peq1Type: number;
+  peq2Freq: number;
+  peq2Q: number;
+  peq2Gain: number;
+  peq2Type: number;
+  peq3Freq: number;
+  peq3Q: number;
+  peq3Gain: number;
+  peq3Type: number;
+  peq4Freq: number;
+  peq4Q: number;
+  peq4Gain: number;
+  peq4Type: number;
+  widenerAmt: number;
+  mono: number;
+  compAmt: number;
+  compThresh: number;
+  compRatio: number;
+  compAttack: number;
+  compRelease: number;
+  gateAmt: number;
+  gateThresh: number;
+  gateRelease: number;
+  transAmt: number;
+  transFreq: number;
+  deessAmt: number;
+  deessFreq: number;
+  tapeAmt: number;
+  tapeTone: number;
+  airAmt: number;
+  airFreq: number;
+  phaserAmt: number;
+  flangerAmt: number;
+  tremoloAmt: number;
+  bitDepth: number;
+  srHold: number;
 }
 
 export interface TrackMetadata {

@@ -41,6 +41,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
 import { GraphicEQ } from './components/GraphicEQ';
+import { ParametricEQ } from './components/ParametricEQ';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -78,6 +79,19 @@ const USER_PRESET_1: MasteringSettings = {
   bass_autotune: 0, bass_reverb: 0, bass_distortion: 0, bass_delay: 0, bass_chorus: 0,
   mid_autotune: 0, mid_reverb: 0, mid_distortion: 0, mid_delay: 0, mid_chorus: 0,
   side_autotune: 0, side_reverb: 0, side_distortion: 0, side_delay: 0, side_chorus: 0,
+  peq1Freq: 15, peq1Q: 1, peq1Gain: 0, peq1Type: 0,
+  peq2Freq: 40, peq2Q: 1, peq2Gain: 0, peq2Type: 0,
+  peq3Freq: 65, peq3Q: 1, peq3Gain: 0, peq3Type: 0,
+  peq4Freq: 85, peq4Q: 1, peq4Gain: 0, peq4Type: 0,
+  widenerAmt: 0, mono: 0,
+  compAmt: 0, compThresh: -18, compRatio: 3, compAttack: 10, compRelease: 150,
+  gateAmt: 0, gateThresh: -48, gateRelease: 100,
+  transAmt: 0, transFreq: 250,
+  deessAmt: 0, deessFreq: 6000,
+  tapeAmt: 0, tapeTone: 6000,
+  airAmt: 0, airFreq: 8000,
+  phaserAmt: 0, flangerAmt: 0, tremoloAmt: 0,
+  bitDepth: 16, srHold: 1,
 };
 
 const NEUTRAL_SETTINGS: MasteringSettings = {
@@ -112,6 +126,19 @@ const NEUTRAL_SETTINGS: MasteringSettings = {
   bass_autotune: 0, bass_reverb: 0, bass_distortion: 0, bass_delay: 0, bass_chorus: 0,
   mid_autotune: 0, mid_reverb: 0, mid_distortion: 0, mid_delay: 0, mid_chorus: 0,
   side_autotune: 0, side_reverb: 0, side_distortion: 0, side_delay: 0, side_chorus: 0,
+  peq1Freq: 15, peq1Q: 1, peq1Gain: 0, peq1Type: 0,
+  peq2Freq: 40, peq2Q: 1, peq2Gain: 0, peq2Type: 0,
+  peq3Freq: 65, peq3Q: 1, peq3Gain: 0, peq3Type: 0,
+  peq4Freq: 85, peq4Q: 1, peq4Gain: 0, peq4Type: 0,
+  widenerAmt: 0, mono: 0,
+  compAmt: 0, compThresh: -18, compRatio: 3, compAttack: 10, compRelease: 150,
+  gateAmt: 0, gateThresh: -48, gateRelease: 100,
+  transAmt: 0, transFreq: 250,
+  deessAmt: 0, deessFreq: 6000,
+  tapeAmt: 0, tapeTone: 6000,
+  airAmt: 0, airFreq: 8000,
+  phaserAmt: 0, flangerAmt: 0, tremoloAmt: 0,
+  bitDepth: 16, srHold: 1,
 };
 
 const getInitialPresets = () => {
@@ -1368,17 +1395,32 @@ export default function App() {
                   unit="dB"
                   disabled={monitoringMode !== 'master'}
                 />
-                <MasteringControl 
-                  label={t.fundamental} 
-                  value={settings.fundamentalFreq} 
-                  min={20} max={200} step={0.01} 
-                  onChange={(v) => updateSetting('fundamentalFreq', v)} 
+                <MasteringControl
+                  label={t.fundamental}
+                  value={settings.fundamentalFreq}
+                  min={20} max={200} step={0.01}
+                  onChange={(v) => updateSetting('fundamentalFreq', v)}
                   tooltip={t.fundamentalTip}
                   unit="Hz"
                   resetValue={60}
                   disabled={monitoringMode !== 'master'}
                 />
               </div>
+            </div>
+
+            {/* PARAMETRIC EQ GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.peq}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <ParametricEQ
+                settings={settings}
+                onChange={updateSetting}
+                disabled={monitoringMode !== 'master'}
+                t={t}
+              />
             </div>
 
             {/* DYNAMICS GROUP */}
@@ -1397,13 +1439,157 @@ export default function App() {
                 unit="LVL"
                 disabled={monitoringMode !== 'master'}
               />
-              <MasteringControl 
-                label={t.limiter} 
-                value={settings.limiter} 
-                min={-5} max={5} step={0.01} 
-                onChange={(v) => updateSetting('limiter', v)} 
+              <MasteringControl
+                label={t.limiter}
+                value={settings.limiter}
+                min={-5} max={5} step={0.01}
+                onChange={(v) => updateSetting('limiter', v)}
                 tooltip={t.limiterTip}
                 unit="dB"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
+            {/* COMPRESSOR GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.comp}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.compAmount}
+                value={settings.compAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('compAmt', v)}
+                tooltip={t.compAmountTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.compThresh}
+                value={settings.compThresh}
+                min={-40} max={0} step={0.5}
+                onChange={(v) => updateSetting('compThresh', v)}
+                tooltip={t.compThreshTip}
+                unit="dB"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.compRatio}
+                value={settings.compRatio}
+                min={1} max={20} step={0.1}
+                onChange={(v) => updateSetting('compRatio', v)}
+                tooltip={t.compRatioTip}
+                unit="x"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.compAttack}
+                value={settings.compAttack}
+                min={1} max={100} step={1}
+                onChange={(v) => updateSetting('compAttack', v)}
+                tooltip={t.compAttackTip}
+                unit="ms"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.compRelease}
+                value={settings.compRelease}
+                min={30} max={500} step={1}
+                onChange={(v) => updateSetting('compRelease', v)}
+                tooltip={t.compReleaseTip}
+                unit="ms"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
+            {/* NOISE GATE GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.gate}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.gateAmount}
+                value={settings.gateAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('gateAmt', v)}
+                tooltip={t.gateAmountTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.gateThreshold}
+                value={settings.gateThresh}
+                min={-60} max={0} step={0.5}
+                onChange={(v) => updateSetting('gateThresh', v)}
+                tooltip={t.gateThresholdTip}
+                unit="dB"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.gateRelease}
+                value={settings.gateRelease}
+                min={20} max={500} step={1}
+                onChange={(v) => updateSetting('gateRelease', v)}
+                tooltip={t.gateReleaseTip}
+                unit="ms"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
+            {/* TRANSIENT SHAPER GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.trans}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.transAmount}
+                value={settings.transAmt}
+                min={-100} max={100} step={0.1}
+                onChange={(v) => updateSetting('transAmt', v)}
+                tooltip={t.transAmountTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.transFreq}
+                value={settings.transFreq}
+                min={50} max={1000} step={1}
+                onChange={(v) => updateSetting('transFreq', v)}
+                tooltip={t.transFreqTip}
+                unit="Hz"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
+            {/* DE-ESSER GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.deess}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.deessAmount}
+                value={settings.deessAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('deessAmt', v)}
+                tooltip={t.deessAmountTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.deessFreq}
+                value={settings.deessFreq}
+                min={4000} max={9000} step={50}
+                onChange={(v) => updateSetting('deessFreq', v)}
+                tooltip={t.deessFreqTip}
+                unit="Hz"
                 disabled={monitoringMode !== 'master'}
               />
             </div>
@@ -1437,6 +1623,87 @@ export default function App() {
               </div>
             </div>
 
+            {/* TAPE SATURATION GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.tape}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.tapeAmount}
+                value={settings.tapeAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('tapeAmt', v)}
+                tooltip={t.tapeAmountTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.tapeTone}
+                value={settings.tapeTone}
+                min={1000} max={12000} step={50}
+                onChange={(v) => updateSetting('tapeTone', v)}
+                tooltip={t.tapeToneTip}
+                unit="Hz"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
+            {/* AIR EXCITER GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.air}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.airAmount}
+                value={settings.airAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('airAmt', v)}
+                tooltip={t.airAmountTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.airFreq}
+                value={settings.airFreq}
+                min={5000} max={12000} step={50}
+                onChange={(v) => updateSetting('airFreq', v)}
+                tooltip={t.airFreqTip}
+                unit="Hz"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
+            {/* BITCRUSHER GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.crush}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.bitDepth}
+                value={settings.bitDepth}
+                min={4} max={16} step={1}
+                onChange={(v) => updateSetting('bitDepth', v)}
+                tooltip={t.bitDepthTip}
+                unit="bit"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.srHold}
+                value={settings.srHold}
+                min={1} max={20} step={1}
+                onChange={(v) => updateSetting('srHold', v)}
+                tooltip={t.srHoldTip}
+                unit="x"
+                disabled={monitoringMode !== 'master'}
+              />
+            </div>
+
             {/* SPATIAL GROUP */}
             <div className="space-y-3">
               <div className="flex items-center gap-2 px-1">
@@ -1453,12 +1720,70 @@ export default function App() {
                 unit="ms"
                 disabled={monitoringMode !== 'master'}
               />
-              <MasteringControl 
-                label={t.stereo} 
-                value={settings.stereoWidth} 
-                min={-50} max={50} step={0.01} 
-                onChange={(v) => updateSetting('stereoWidth', v)} 
+              <MasteringControl
+                label={t.stereo}
+                value={settings.stereoWidth}
+                min={-50} max={50} step={0.01}
+                onChange={(v) => updateSetting('stereoWidth', v)}
                 tooltip={t.stereoTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.widener}
+                value={settings.widenerAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('widenerAmt', v)}
+                tooltip={t.widenerTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <button
+                onClick={() => updateSetting('mono', settings.mono ? 0 : 1)}
+                disabled={monitoringMode !== 'master'}
+                title={t.monoTip}
+                className={cn(
+                  "w-full text-[9px] px-3 py-1.5 border uppercase font-bold tracking-[0.2em] rounded-sm disabled:opacity-30 transition-all",
+                  settings.mono
+                    ? "bg-[var(--accent)] border-[var(--accent)] text-black"
+                    : "bg-black border-[#444] hover:border-[var(--accent)] hover:text-[#fff] text-[var(--text-dim)]"
+                )}
+              >
+                {t.mono}
+              </button>
+            </div>
+
+            {/* MOD FX GROUP */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 px-1">
+                <div className="h-[1px] flex-1 bg-white/5" />
+                <span className="text-[8px] font-bold uppercase tracking-[0.2em] text-[#444]">{t.modfx}</span>
+                <div className="h-[1px] flex-1 bg-white/5" />
+              </div>
+              <MasteringControl
+                label={t.phaser}
+                value={settings.phaserAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('phaserAmt', v)}
+                tooltip={t.phaserTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.flanger}
+                value={settings.flangerAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('flangerAmt', v)}
+                tooltip={t.flangerTip}
+                unit="LVL"
+                disabled={monitoringMode !== 'master'}
+              />
+              <MasteringControl
+                label={t.tremolo}
+                value={settings.tremoloAmt}
+                min={0} max={100} step={0.1}
+                onChange={(v) => updateSetting('tremoloAmt', v)}
+                tooltip={t.tremoloTip}
                 unit="LVL"
                 disabled={monitoringMode !== 'master'}
               />

@@ -21,6 +21,16 @@ const SETTING_PARAM_NAMES = [
   'bass_autotune', 'bass_reverb', 'bass_distortion', 'bass_delay', 'bass_chorus',
   'mid_autotune', 'mid_reverb', 'mid_distortion', 'mid_delay', 'mid_chorus',
   'side_autotune', 'side_reverb', 'side_distortion', 'side_delay', 'side_chorus',
+  'peq1Freq', 'peq1Q', 'peq1Gain', 'peq1Type',
+  'peq2Freq', 'peq2Q', 'peq2Gain', 'peq2Type',
+  'peq3Freq', 'peq3Q', 'peq3Gain', 'peq3Type',
+  'peq4Freq', 'peq4Q', 'peq4Gain', 'peq4Type',
+  'widenerAmt', 'mono', 'compAmt', 'compThresh', 'compRatio',
+  'compAttack', 'compRelease', 'gateAmt', 'gateThresh',
+  'gateRelease', 'transAmt', 'transFreq',
+  'deessAmt', 'deessFreq', 'tapeAmt', 'tapeTone', 'airAmt',
+  'airFreq', 'phaserAmt', 'flangerAmt', 'tremoloAmt',
+  'bitDepth', 'srHold',
 ] as const;
 
 export class AudioEngine {
@@ -598,6 +608,45 @@ export class AudioEngine {
     setParam("eq4k", settings.eq4k);
     setParam("eq8k", settings.eq8k);
     setParam("eq16k", settings.eq16k);
+    setParam("peq1Freq", settings.peq1Freq);
+    setParam("peq1Q", settings.peq1Q);
+    setParam("peq1Gain", settings.peq1Gain);
+    setParam("peq1Type", settings.peq1Type);
+    setParam("peq2Freq", settings.peq2Freq);
+    setParam("peq2Q", settings.peq2Q);
+    setParam("peq2Gain", settings.peq2Gain);
+    setParam("peq2Type", settings.peq2Type);
+    setParam("peq3Freq", settings.peq3Freq);
+    setParam("peq3Q", settings.peq3Q);
+    setParam("peq3Gain", settings.peq3Gain);
+    setParam("peq3Type", settings.peq3Type);
+    setParam("peq4Freq", settings.peq4Freq);
+    setParam("peq4Q", settings.peq4Q);
+    setParam("peq4Gain", settings.peq4Gain);
+    setParam("peq4Type", settings.peq4Type);
+    setParam("widenerAmt", settings.widenerAmt);
+    setParam("mono", settings.mono);
+    setParam("compAmt", settings.compAmt);
+    setParam("compThresh", settings.compThresh);
+    setParam("compRatio", settings.compRatio);
+    setParam("compAttack", settings.compAttack);
+    setParam("compRelease", settings.compRelease);
+    setParam("gateAmt", settings.gateAmt);
+    setParam("gateThresh", settings.gateThresh);
+    setParam("gateRelease", settings.gateRelease);
+    setParam("transAmt", settings.transAmt);
+    setParam("transFreq", settings.transFreq);
+    setParam("deessAmt", settings.deessAmt);
+    setParam("deessFreq", settings.deessFreq);
+    setParam("tapeAmt", settings.tapeAmt);
+    setParam("tapeTone", settings.tapeTone);
+    setParam("airAmt", settings.airAmt);
+    setParam("airFreq", settings.airFreq);
+    setParam("phaserAmt", settings.phaserAmt);
+    setParam("flangerAmt", settings.flangerAmt);
+    setParam("tremoloAmt", settings.tremoloAmt);
+    setParam("bitDepth", settings.bitDepth);
+    setParam("srHold", settings.srHold);
     applyParams(startSec);
 
     // Schedule suspensions for automation
@@ -936,6 +985,46 @@ export class AudioEngine {
     setParam("side_distortion", settings.side_distortion);
     setParam("side_delay", settings.side_delay);
     setParam("side_chorus", settings.side_chorus);
+
+    setParam("peq1Freq", settings.peq1Freq);
+    setParam("peq1Q", settings.peq1Q);
+    setParam("peq1Gain", settings.peq1Gain);
+    setParam("peq1Type", settings.peq1Type);
+    setParam("peq2Freq", settings.peq2Freq);
+    setParam("peq2Q", settings.peq2Q);
+    setParam("peq2Gain", settings.peq2Gain);
+    setParam("peq2Type", settings.peq2Type);
+    setParam("peq3Freq", settings.peq3Freq);
+    setParam("peq3Q", settings.peq3Q);
+    setParam("peq3Gain", settings.peq3Gain);
+    setParam("peq3Type", settings.peq3Type);
+    setParam("peq4Freq", settings.peq4Freq);
+    setParam("peq4Q", settings.peq4Q);
+    setParam("peq4Gain", settings.peq4Gain);
+    setParam("peq4Type", settings.peq4Type);
+    setParam("widenerAmt", settings.widenerAmt);
+    setParam("mono", settings.mono);
+    setParam("compAmt", settings.compAmt);
+    setParam("compThresh", settings.compThresh);
+    setParam("compRatio", settings.compRatio);
+    setParam("compAttack", settings.compAttack);
+    setParam("compRelease", settings.compRelease);
+    setParam("gateAmt", settings.gateAmt);
+    setParam("gateThresh", settings.gateThresh);
+    setParam("gateRelease", settings.gateRelease);
+    setParam("transAmt", settings.transAmt);
+    setParam("transFreq", settings.transFreq);
+    setParam("deessAmt", settings.deessAmt);
+    setParam("deessFreq", settings.deessFreq);
+    setParam("tapeAmt", settings.tapeAmt);
+    setParam("tapeTone", settings.tapeTone);
+    setParam("airAmt", settings.airAmt);
+    setParam("airFreq", settings.airFreq);
+    setParam("phaserAmt", settings.phaserAmt);
+    setParam("flangerAmt", settings.flangerAmt);
+    setParam("tremoloAmt", settings.tremoloAmt);
+    setParam("bitDepth", settings.bitDepth);
+    setParam("srHold", settings.srHold);
 
     const source = offlineCtx.createBufferSource();
     source.buffer = this.buffer;
