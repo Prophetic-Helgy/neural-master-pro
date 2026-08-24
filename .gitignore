@@ -48,3 +48,6 @@ test-reverb2.dsp
 docs/screenshots/tone_test.wav
 test-api.mjs
 test_getparams.mjs
+
+# local upload helper (contains PAT — never commit)
+upload_exes_nightly.sh
