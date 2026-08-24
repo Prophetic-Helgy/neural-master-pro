@@ -6,7 +6,8 @@
 |---|---|
 | ![Pro realtime mixer](docs/screenshots/01-pro-mixer.png) | ![Lite one-click mastering with Before/After + findings](docs/screenshots/02-lite-after.png) |
 | ![Batch + export panel (WAV/MP3/FLAC/AAC)](docs/screenshots/03-batch-export.png) | ![A/B compare + BS.1770-4 metrics](docs/screenshots/04-ab-metrics.png) |
-| ![Russian localization](docs/screenshots/05-i18n-ru.png) | |
+| ![Russian localization](docs/screenshots/05-i18n-ru.png) | ![4-band parametric EQ](docs/screenshots/06-vst-peq.png) |
+| ![Tape saturation + air exciter + bitcrusher](docs/screenshots/07-vst-texture.png) | ![Widener, MONO and mod FX](docs/screenshots/08-vst-spatial.png) |
 
 ## Why
 
