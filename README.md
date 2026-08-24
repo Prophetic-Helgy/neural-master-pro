@@ -39,7 +39,7 @@ Grab the latest build from [GitHub Releases](https://github.com/Prophetic-Helgy/
 Every release lists a SHA-256 checksum per file. Verify with:
 
 ```powershell
-Get-FileHash .\Neural Master Pro 2.2 Setup 2.2.0.exe -Algorithm SHA256
+Get-FileHash .\Neural.Master.Pro.2.2.Setup.2.2.0.exe -Algorithm SHA256
 ```
 
 ## Build from source
