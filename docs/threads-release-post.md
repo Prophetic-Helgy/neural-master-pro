@@ -1,4 +1,4 @@
-# Threads release post — Neural Master Pro 2.2
+# Threads release post — Neural Master Pro 2.4
 
 Viral hook (branch name): **EN:** “Your AI tracks deserve a real release — not just a draft.” / **RU:** “Твой AI-трек заслуживает релиза, а не только драфта.”
 
@@ -16,9 +16,10 @@ Millions of creators are making music with AI. But the raw output of Suno and Ud
 
 Platforms (Spotify, Apple Music, YouTube, TikTok) reject or demonetize such tracks.
 
-We built Neural Master Pro to close that gap:
+We built Neural Master Pro to close that gap — and v2.4 turns it into a full mastering studio:
 
 → One-click mastering with 10 platform presets (Spotify, Apple Music, TikTok/Shorts, YouTube…)
+→ Pro realtime mixer with 10 VST-class modules: 4-band parametric EQ, bus compressor, noise gate, transient shaper, de-esser, tape saturation, air exciter, stereo widener + MONO, phaser, flanger, tremolo, bitcrusher
 → Real BS.1770-4 metrics: integrated LUFS, true peak, LRA — a Before/After table
 → Loudness locked to the exact platform target, true peak under the ceiling
 → 100% offline: your audio never leaves your device. No cloud, no account
@@ -28,7 +29,7 @@ Free for now, for personal use.
 
 👉 https://github.com/Prophetic-Helgy/neural-master-pro/releases
 
-#AIMusic #AIArtist #Suno #SunoAI #Udio #AIMusicMaker #MusicProduction #Mastering #AudioMastering #MusicTech #AItools #IndieArtist #MusicRelease #NeuralMasterPro
+#AIMusic #AIArtist #Suno #SunoAI #Udio #AIMusicMaker #MusicProduction #Mastering #AudioMastering #MusicTech #AItools #IndieArtist #MusicRelease #DSP #NeuralMasterPro
 
 ---
 
@@ -44,9 +45,10 @@ Free for now, for personal use.
 
 Площадки (Spotify, Apple Music, YouTube, TikTok) отклоняют или демонетизируют такие треки.
 
-Мы собрали Neural Master Pro, чтобы закрыть этот разрыв:
+Мы собрали Neural Master Pro, чтобы закрыть этот разрыв — а в v2.4 он стал полноценной мастеринг-студией:
 
 → Мастеринг в один клик: 10 пресетов площадок (Spotify, Apple Music, TikTok/Shorts, YouTube…)
+→ Pro-микшер в реальном времени: 4-полосный параметрический EQ, bus-компрессор, noise gate, transient shaper, деэссер, tape saturation, air exciter, stereo widener + MONO, phaser, flanger, tremolo, bitcrusher — 10 VST-модулей
 → Честные метрики BS.1770-4: интегрированный LUFS, true peak, LRA — таблица Before/After
 → Громкость зафиксирована точно по таргету площадки, true peak под потолком
 → 100% офлайн: аудио никогда не покидает устройство. Без облака и аккаунта
@@ -56,4 +58,4 @@ Free for now, for personal use.
 
 👉 https://github.com/Prophetic-Helgy/neural-master-pro/releases
 
-#AIMusic #AIArtist #Suno #SunoAI #Udio #AIMusicMaker #MusicProduction #Mastering #AudioMastering #MusicTech #AItools #IndieArtist #MusicRelease #NeuralMasterPro
+#AIMusic #AIArtist #Suno #SunoAI #Udio #AIMusicMaker #MusicProduction #Mastering #AudioMastering #MusicTech #AItools #IndieArtist #MusicRelease #DSP #NeuralMasterPro
