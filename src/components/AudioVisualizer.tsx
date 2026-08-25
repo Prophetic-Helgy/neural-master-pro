@@ -9,17 +9,31 @@ interface Props {
   onCanvasReady?: (canvas: HTMLCanvasElement) => void;
   exportMode?: boolean;
   metadata?: { title: string };
-  bgVideoUrl?: string | null;
+  coverOffset?: { x: number; y: number };
+  /** Background stock clips (export mode), rotation order; up to 4. */
+  bgVideoUrls?: string[] | null;
+  /** Cut-point times in seconds from the export start (audio peaks). */
+  bgCueTimes?: number[] | null;
+  /** Audio clock: seconds since export start (the cue math reads it per frame). */
+  bgGetTime?: () => number;
   creditText?: string | null;
-  onBgVideoReady?: (video: HTMLVideoElement | null) => void;
+  /** Reports the created (detached) video elements in selection order. */
+  onBgVideosReady?: (videos: HTMLVideoElement[]) => void;
 }
 
-export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, width = 800, height = 200, exportMode, metadata, onCanvasReady, bgVideoUrl, creditText, onBgVideoReady }) => {
+export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, width = 800, height = 200, exportMode, metadata, onCanvasReady, coverOffset = { x: 0, y: 0 }, bgVideoUrls, bgCueTimes, bgGetTime, creditText, onBgVideosReady }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
-  const videoElRef = useRef<HTMLVideoElement | null>(null);
+  const videoElsRef = useRef<HTMLVideoElement[]>([]);
   const [dimensions, setDimensions] = useState({ w: width, h: height });
+
+  // Latest bg props for the rAF loop — assigned after every render, read per
+  // frame (NOT a draw dep: swapping the array must not restart the loop).
+  const bgStateRef = useRef<{ urls: string[]; cues: number[]; getTime: (() => number) | null }>({ urls: [], cues: [], getTime: null });
+  useEffect(() => {
+    bgStateRef.current = { urls: bgVideoUrls ?? [], cues: bgCueTimes ?? [], getTime: bgGetTime ?? null };
+  });
 
   useEffect(() => {
     if (exportMode) {
@@ -56,35 +70,43 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
     }
   }, [coverArt]);
 
-  // Background stock video (export mode only). The element lives in a ref —
-  // the rAF loop reads it every frame, so it is deliberately NOT a draw dep.
+  // Background stock clips (export mode only). The elements live in a ref —
+  // the rAF loop reads them every frame, so they are deliberately NOT draw
+  // deps. Each clip plays continuously from t=0 (muted, loop) and is NEVER
+  // seeked — the cut between clips is a draw-side crossfade on the cue times.
+  const bgUrlKey = (bgVideoUrls ?? []).join('|');
   useEffect(() => {
-    const prev = videoElRef.current;
-    if (prev) {
-      prev.pause();
-      prev.removeAttribute('src');
-      prev.load();
-    }
-    videoElRef.current = null;
-    onBgVideoReady?.(null);
-
-    if (bgVideoUrl) {
-      const v = document.createElement('video');
-      v.muted = true;
-      v.loop = true;
-      (v as any).playsInline = true;
-      v.preload = 'auto';
-      v.src = bgVideoUrl;
+    const prev = videoElsRef.current;
+    videoElsRef.current = [];
+    onBgVideosReady?.([]);
+    prev.forEach((v) => {
+      v.pause();
+      v.removeAttribute('src');
       v.load();
-      v.play().catch(() => {});
-      videoElRef.current = v;
-      onBgVideoReady?.(v);
+    });
+
+    const urls = bgVideoUrls ?? [];
+    if (urls.length > 0) {
+      const els: HTMLVideoElement[] = [];
+      urls.forEach((url) => {
+        const v = document.createElement('video');
+        v.muted = true;
+        v.loop = true;
+        (v as any).playsInline = true;
+        v.preload = 'auto';
+        v.src = url;
+        v.load();
+        v.play().catch(() => {});
+        els.push(v);
+      });
+      videoElsRef.current = els;
+      onBgVideosReady?.(els);
     }
     return () => {
-      if (videoElRef.current) videoElRef.current.pause();
+      videoElsRef.current.forEach((v) => v.pause());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bgVideoUrl]);
+  }, [bgUrlKey]);
 
   useEffect(() => {
     if (!analyser || !canvasRef.current || dimensions.w === 0 || dimensions.h === 0) return;
@@ -133,18 +155,45 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
       ctx.fillStyle = '#090a0c';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      // Pexels background video (export mode): cover-fit under the visualizer
-      const bgV = videoElRef.current;
-      if (exportMode && bgV && bgV.readyState >= 2 && bgV.videoWidth > 0 && bgV.videoHeight > 0) {
-        const vScale = Math.max(canvas.width / bgV.videoWidth, canvas.height / bgV.videoHeight);
-        const vdw = bgV.videoWidth * vScale;
-        const vd = bgV.videoHeight * vScale;
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(bgV, (canvas.width - vdw) / 2, (canvas.height - vd) / 2, vdw, vd);
+      // Pexels background clips (export mode): cover-fit under the overlay.
+      // With cue times the loop crossfades between clips 0.6 s AFTER each
+      // audio peak (k = number of cues at or before t; during the window the
+      // next clip fades in over the current one). With any ready clip the
+      // standard visualizer is suppressed (bgActive) — only the track title,
+      // the cover frame and the credit remain. Not-ready clips drop out of
+      // the rotation (readyVids), so a slow download degrades the cut count,
+      // never the video.
+      const bg = bgStateRef.current;
+      const readyVids = videoElsRef.current.filter((v) => v.readyState >= 2 && v.videoWidth > 0 && v.videoHeight > 0);
+      const bgActive = exportMode && bg.urls.length > 0 && readyVids.length > 0;
+      if (bgActive) {
+        const tNow = bg.getTime ? bg.getTime() : 0;
+        const cues = bg.cues;
+        let k = 0;
+        for (let ci = 0; ci < cues.length; ci += 1) {
+          if (cues[ci] <= tNow) k += 1; else break;
+        }
+        const drawVid = (v: HTMLVideoElement, alpha: number) => {
+          const vScale = Math.max(canvas.width / v.videoWidth, canvas.height / v.videoHeight);
+          const vdw = v.videoWidth * vScale;
+          const vd = v.videoHeight * vScale;
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          if (alpha < 1) ctx.globalAlpha = alpha;
+          ctx.drawImage(v, (canvas.width - vdw) / 2, (canvas.height - vd) / 2, vdw, vd);
+          if (alpha < 1) ctx.globalAlpha = 1;
+        };
+        const n = readyVids.length;
+        if (cues.length > 0 && k >= 1 && tNow - cues[k - 1] < 0.6) {
+          const alpha = (tNow - cues[k - 1]) / 0.6;
+          drawVid(readyVids[(k - 1) % n], 1);
+          drawVid(readyVids[k % n], alpha);
+        } else {
+          drawVid(readyVids[k % n], 1);
+        }
       }
 
-      if (mode === 'bars') {
+      if (!bgActive && mode === 'bars') {
         analyser.getByteFrequencyData(dataArray);
         // Use exactly the right barWidth to fill the full width. Downsample
         // to ~96 bars: 717 createLinearGradient calls/frame was the heaviest
@@ -168,7 +217,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           ctx.fillRect(x, canvas.height - barHeight, barWidth - gap, barHeight);
           x += barWidth;
         }
-      } else if (mode === 'circle') {
+      } else if (!bgActive && mode === 'circle') {
         analyser.getByteTimeDomainData(timeData);
         analyser.getByteFrequencyData(dataArray);
 
@@ -202,12 +251,16 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
            const imgAspect = img.width / img.height;
            let dw = imgRadius * 2;
            let dh = imgRadius * 2;
-           if (imgAspect > 1) { dw = dh * imgAspect; } 
+           if (imgAspect > 1) { dw = dh * imgAspect; }
            else { dh = dw / imgAspect; }
            // Add high quality smoothing
            ctx.imageSmoothingEnabled = true;
            ctx.imageSmoothingQuality = 'high';
-           ctx.drawImage(img, centerX - dw/2, centerY - dh/2, dw, dh);
+           // Cover pan: shift the crop inside the overflow (same -1..1
+           // value as the UI preview / export frame).
+           const offX = imgAspect > 1 ? coverOffset.x * (dw - imgRadius * 2) / 2 : 0;
+           const offY = imgAspect < 1 ? coverOffset.y * (dh - imgRadius * 2) / 2 : 0;
+           ctx.drawImage(img, centerX - dw/2 + offX, centerY - dh/2 + offY, dw, dh);
         } else {
            // Placeholder Neon Brain Vector
            ctx.fillStyle = '#0a0a0c';
@@ -258,7 +311,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           }
         }
         ctx.globalCompositeOperation = 'source-over';
-      } else if (mode === 'wave') {
+      } else if (!bgActive && mode === 'wave') {
         analyser.getByteTimeDomainData(dataArray);
         ctx.lineWidth = 2;
         ctx.strokeStyle = '#00ffd2';
@@ -279,7 +332,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
 
         ctx.lineTo(canvas.width, canvas.height / 2);
         ctx.stroke();
-      } else if (mode === 'alchemy') {
+      } else if (!bgActive && mode === 'alchemy') {
         analyser.getByteFrequencyData(dataArray);
 
         // Deep blue background effect
@@ -328,7 +381,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           ctx.fill();
         }
         ctx.globalCompositeOperation = 'source-over';
-      } else if (mode === 'circles') {
+      } else if (!bgActive && mode === 'circles') {
         analyser.getByteFrequencyData(dataArray);
         ctx.fillStyle = 'rgba(5, 10, 15, 0.2)';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -368,7 +421,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           ctx.stroke();
         }
         ctx.globalCompositeOperation = 'source-over';
-      } else if (mode === 'flight') {
+      } else if (!bgActive && mode === 'flight') {
         analyser.getByteFrequencyData(dataArray);
         ctx.fillStyle = 'rgba(2, 6, 12, 0.3)';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -414,7 +467,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           ctx.fill();
         });
         ctx.globalCompositeOperation = 'source-over';
-      } else if (mode === 'smoke') {
+      } else if (!bgActive && mode === 'smoke') {
         // Redefined "smoke" to "Neon Swarm / Fireflies"
         analyser.getByteFrequencyData(dataArray);
         ctx.fillStyle = 'rgba(2, 5, 12, 0.25)';
@@ -512,8 +565,10 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
         ctx.fillText(titleText, canvas.width / 2, canvas.height - paddingBottom);
         ctx.shadowBlur = 0; // Reset
 
-        // If not glitch mode, draw the frame and photo
-        if (mode !== 'circle') {
+        // If not glitch mode, draw the frame and photo. In the Pexels
+        // background the frame is the "album logo" the user keeps — always
+        // drawn there, whatever the visualizer mode is.
+        if (mode !== 'circle' || bgActive) {
           // Image frame (aiming for roughly ~20% of canvas area)
           const area = canvas.width * canvas.height;
           let imgSize = Math.sqrt(area * 0.20);
@@ -541,9 +596,13 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
             const imgAspect = img.width / img.height;
             let dw = imgSize;
             let dh = imgSize;
-            if (imgAspect > 1) { dw = dh * imgAspect; } 
+            if (imgAspect > 1) { dw = dh * imgAspect; }
             else { dh = dw / imgAspect; }
-            ctx.drawImage(img, imgX - (dw - imgSize) / 2, imgY - (dh - imgSize) / 2, dw, dh);
+            // Cover pan: shift the crop inside the overflow (same -1..1
+            // value as the UI preview / circle mode).
+            const offX = imgAspect > 1 ? coverOffset.x * (dw - imgSize) / 2 : 0;
+            const offY = imgAspect < 1 ? coverOffset.y * (dh - imgSize) / 2 : 0;
+            ctx.drawImage(img, imgX - (dw - imgSize) / 2 + offX, imgY - (dh - imgSize) / 2 + offY, dw, dh);
           } else {
             ctx.fillStyle = '#0a0a0c';
             ctx.fillRect(imgX, imgY, imgSize, imgSize);
@@ -572,7 +631,7 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
 
     draw();
     return () => cancelAnimationFrame(animationId);
-  }, [analyser, mode, exportMode, metadata, dimensions]);
+  }, [analyser, mode, exportMode, metadata, dimensions, coverOffset]);
 
   return (
     <div ref={containerRef} className="w-full h-full relative rounded-lg bg-[#151619] overflow-hidden flex items-center justify-center">

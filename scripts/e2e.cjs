@@ -13,7 +13,8 @@
  *                    isReady (A2), TONAL/FX/EQ sliders move the DSP
  *                    (live param readback + offline renderProPcm diff per
  *                    parameter), FX regions (A3 toast, in-window-only
- *                    effect), monitoring A/B, 7 visualizers, transport.
+ *                    effect), monitoring A/B, 7 visualizers, transport,
+ *                    Reset clears the whole Pro panel block.
  *   M2 Lite        — 10 presets hit LUFS target / stay under the TP ceiling,
  *                    custom preset, A/B hold, batch of 3 -> ZIP with valid
  *                    WAVs, exports WAV 16/24/32f, MP3 192/320, FLAC.
@@ -21,7 +22,12 @@
  *                    title metadata), video (webm/mp4, duration ~= trim).
  *   M4 System      — 9 languages (no "undefined", localized labels),
  *                    hardware widget honest in headless (--°C), FPS p95
- *                    over 60 s playback, zero unexpected console issues.
+ *                    over 60 s playback, FPS on a fresh page while the
+ *                    metrics pass runs in the worker, timeline slider
+ *                    frozen on pause, Pexels multi-clip export cutting on
+ *                    the audio peaks (synthetic offline clips, pixel checks
+ *                    on the hidden export canvas), zero unexpected console
+ *                    issues.
  *
  * All DOM helpers live IN the page (window.__h) because page.evaluate only
  * serializes its own function. Downloads are captured in-page (blob anchor
@@ -207,7 +213,13 @@ async function installPageHelpers(page) {
       const span = document.querySelector('div.space-y-1 span');
       return span ? span.textContent : '';
     };
-    window.__h = { inputSet, setTonalSlider, setFxSlider, eqSetBand, clickText, clickTextStart, clickLiteMaster, dspParam, peqSet, setRangeByMinMax, seekBar, getSeekBarLabel };
+    /** Current value of the TimeControls seek bar (same selector as seekBar). */
+    const seekBarValue = () => {
+      const r = [...document.querySelectorAll('input[type="range"]')]
+        .find((x) => x.min === '0' && +x.max >= 9.5 && +x.max <= 11 && !x.className.includes('opacity-0'));
+      return r ? parseFloat(r.value) : null;
+    };
+    window.__h = { inputSet, setTonalSlider, setFxSlider, eqSetBand, clickText, clickTextStart, clickLiteMaster, dspParam, peqSet, setRangeByMinMax, seekBar, getSeekBarLabel, seekBarValue };
   });
 }
 
@@ -436,6 +448,13 @@ async function awaitDownload(page, ms = 120000) {
   const B1 = path.join(OUT_DIR, 'e2e_batch1.wav');
   const B2 = path.join(OUT_DIR, 'e2e_batch2.wav');
   const B3 = path.join(OUT_DIR, 'e2e_batch3.wav');
+  // 64x32 cover fixture: left half red, right half blue (aspect 2:1 — pan
+  // possible horizontally only; a dragged offset shifts red in / blue out).
+  const COVER_WIDE = path.join(OUT_DIR, 'e2e_cover_wide.png');
+  fs.writeFileSync(COVER_WIDE, Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAAAgCAIAAAAt/+nTAAAAO0lEQVR4nO3PMQ0AAAgDMERw41' +
+    '/ZdKCBg69JDbTS82o6r0pAQEBAQEBAQEBAQEBAQEBAQEBAQEBA4GoBR67AeeBFlJEAAAAA' +
+    'SUVORK5CYII=', 'base64'));
   writeToneWav(TONE, [110, 220, 440], 10);
   writeToneWav(REFTONE, [330, 660, 990], 10);
   writeToneWav(HIGHTONE, [4400, 8800, 12000], 10);
@@ -1029,6 +1048,153 @@ async function awaitDownload(page, ms = 120000) {
   }
 
   // =========================================================================
+  section('M1.10 — Reset: whole Pro panel block returns to neutral');
+  // =========================================================================
+  {
+    const neutral = await page.evaluate(() => window.__NMP__.getNeutralSettings());
+    // Dirty every slice of the Pro block: a module param, the active save
+    // slot, an FX region (only addable while monitoring MASTER) and
+    // A/B monitoring (Source = bypass).
+    await h(page, 'setTonalSlider', 'Drive / Loudness', 5);
+    await h(page, 'clickText', '3');
+    await sleep(200);
+    await h(page, 'clickText', '+ ADD FX REGION');
+    await sleep(400);
+    await page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Source');
+      if (b) b.click();
+    });
+    await sleep(300);
+    const activeSlot = () => page.evaluate(() => {
+      const slots = [...document.querySelectorAll('button')].filter((b) => /^\d$/.test(b.textContent.trim()));
+      const on = slots.filter((s) => s.className.includes('bg-[var(--accent)]'));
+      return on.length === 1 ? parseInt(on[0].textContent.trim(), 10) : null;
+    });
+    const dirtyGain = await h(page, 'dspParam', 'gain');
+    const dirtyOk = dirtyGain && !dirtyGain.err && Math.abs(dirtyGain.value - 5) < 0.1
+      && (await activeSlot()) === 3
+      && (await page.evaluate(() => window.__NMP__.getEngine().getBypass())) === true
+      && (await page.evaluate(() => document.body.innerText.toLowerCase().includes('fx automation regions (editing area)')));
+    check('Pro block is dirty (precondition)', !!dirtyOk,
+      `gain=${dirtyGain && dirtyGain.value}, slot=${await activeSlot()}, bypass=${await page.evaluate(() => window.__NMP__.getEngine().getBypass())}`);
+
+    const resetClicked = await h(page, 'clickText', 'Reset');
+    await sleep(400);
+    const gain = await h(page, 'dspParam', 'gain');
+    const slot = await activeSlot();
+    const bypass = await page.evaluate(() => window.__NMP__.getEngine().getBypass());
+    const editing = await page.evaluate(() => document.body.innerText.toLowerCase().includes('fx automation regions (editing area)'));
+    const monBtns = await page.evaluate(() => {
+      const bs = [...document.querySelectorAll('button')].filter((b) => ['Master', 'Source', 'Ref'].includes(b.textContent.trim()));
+      return bs.map((b) => ({ t: b.textContent.trim(), on: b.className.includes('bg-[var(--accent)]') }));
+    });
+    const dur = await page.evaluate(() => window.__NMP__.getEngine().getDuration());
+    check('Reset: module params back to neutral (live DSP)',
+      resetClicked && gain && !gain.err && Math.abs(gain.value - (neutral.gain ?? 0)) < 0.01,
+      `gain=${gain && gain.value}, neutral=${neutral && neutral.gain}`);
+    check('Reset: active save slot back to 1', slot === 1, `slot=${slot}`);
+    check('Reset: monitoring back to MASTER (bypass off)',
+      bypass === false && monBtns.length === 3 && monBtns[0].on && !monBtns[1].on,
+      JSON.stringify(monBtns));
+    check('Reset: FX region removed', !editing, `editingHeader=${editing}`);
+    check('Reset: track untouched (duration intact)', dur > 9, `dur=${dur.toFixed(2)}`);
+  }
+
+  // =========================================================================
+  section('M1.11 — Cover art: upload + drag-to-pan inside the frame');
+  // =========================================================================
+  {
+    // Instrument before the upload: when does the pan transform appear, and
+    // is the main thread stalled (rAF deltas) while we wait? (Run 5 saw the
+    // transform appear just after the old 5 s window in the full-suite
+    // context, 107 ms in an isolated repro — this pinpoints the delay.)
+    await page.evaluate(() => {
+      window.__covT0 = performance.now();
+      window.__covTransformAt = null;
+      window.__rafDeltas = [];
+      let last = performance.now();
+      const tick = () => {
+        const now = performance.now();
+        window.__rafDeltas.push(now - last);
+        if (window.__rafDeltas.length > 4000) window.__rafDeltas.shift();
+        last = now;
+        if (window.__covTransformAt === null) {
+          const img = document.querySelector('img[alt="Cover Art"]');
+          if (img && /translate\(/.test(img.style.transform || '')) {
+            window.__covTransformAt = Math.round(now - window.__covT0);
+          }
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    const coverInput = await page.$('#cover-upload');
+    let upOk = false;
+    if (coverInput) { await coverInput.uploadFile(COVER_WIDE); upOk = true; }
+    // The aspect probe (Image onload) sets the pan transform even at 0 offset,
+    // so its presence also proves the image was accepted and measured.
+    // NOTE: waitFor serializes fn INTO the page — fn must be a page-context
+    // function (a Node-side thunk calling page.evaluate would throw there).
+    const aspectKnown = await waitFor(page, () => {
+      const img = document.querySelector('img[alt="Cover Art"]');
+      return !!(img && /translate\(/.test(img.style.transform || ''));
+    }, 15000);
+    const covInfo = await page.evaluate(() => ({
+      at: window.__covTransformAt,
+      maxRaf: window.__rafDeltas.length ? Math.max(...window.__rafDeltas) : 0,
+      slow: window.__rafDeltas.filter((d) => d > 100).length,
+    }));
+    check('cover: wide image uploaded + aspect detected', upOk && aspectKnown,
+      `upOk=${upOk} aspectKnown=${aspectKnown} transformAt=${covInfo.at}ms maxRaf=${covInfo.maxRaf.toFixed(0)}ms slowFrames=${covInfo.slow}`);
+    const imgBox = await page.evaluate(() => {
+      const img = document.querySelector('img[alt="Cover Art"]');
+      const r = img.getBoundingClientRect();
+      return { x: r.x, y: r.y, w: r.width, h: r.height };
+    });
+    const readShiftPct = () => page.evaluate(() => {
+      const img = document.querySelector('img[alt="Cover Art"]');
+      const m = /translate\(([-\d.]+)%/.exec(img.style.transform || '');
+      return m ? parseFloat(m[1]) : 0;
+    });
+    const before = await readShiftPct();
+    const cx = imgBox.x + imgBox.w / 2;
+    const cy = imgBox.y + imgBox.h / 2;
+
+    // Drag ~30% of the box width right (real mouse => real pointerId, so
+    // setPointerCapture in the handler works).
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    await page.mouse.move(cx + imgBox.w * 0.3, cy, { steps: 4 });
+    await page.mouse.up();
+    await sleep(200);
+    const mid = await readShiftPct();
+    // Chromium may coalesce fast pointermove steps, so the exact distance is
+    // not asserted here — the exact mapping is proven by the clamp check
+    // below (reaching exactly +50% requires the full px -> % math).
+    check('cover: drag pans the image (transform moved right)', mid > before + 2,
+      `before=${before} mid=${mid}`);
+
+    // Drag far beyond the right edge -> clamps at +50% (aspect 2:1 => the
+    // cover overflow is half the box, i.e. 50% of the square element).
+    await page.mouse.move(cx + imgBox.w * 0.3, cy);
+    await page.mouse.down();
+    await page.mouse.move(cx + imgBox.w * 3, cy, { steps: 6 });
+    await page.mouse.up();
+    await sleep(200);
+    const clamped = await readShiftPct();
+    check('cover: pan clamped at the edge (+50%)', Math.abs(clamped - 50) < 0.5,
+      `clamped=${clamped}`);
+
+    // DEV hook resets the offset -> transform back to 0 for later sections
+    // (M3 video export draws the cover frame).
+    const resetOk = await page.evaluate(() => window.__NMP__.resetCoverOffset());
+    await sleep(150);
+    const after = await readShiftPct();
+    check('cover: offset reset to center', resetOk === true && Math.abs(after) < 0.001,
+      `resetOk=${resetOk} after=${after}`);
+  }
+
+  // =========================================================================
   section('M2.1 — Lite: 10 presets hit LUFS target and TP ceiling');
   // =========================================================================
   {
@@ -1316,6 +1482,281 @@ async function awaitDownload(page, ms = 120000) {
     check('FPS steady 50 s: p95 <= 40 ms', !!steady && steady.p95 <= 40, JSON.stringify(steady));
     check('no frame drops > 100 ms in steady state', !!steady && steady.gt100 === 0, JSON.stringify(steady));
     await page.evaluate(() => window.__NMP__.getEngine().stop());
+  }
+
+  // =========================================================================
+  section('M4.3b — Fresh page: first 10 s of playback with the metrics pass running');
+  // =========================================================================
+  // The pre-mastering metrics pass (LUFS/LRA/true-peak/tone) now runs in a
+  // web worker started at upload. This is the real regression M4.3 misses:
+  // a fresh page plays IMMEDIATELY, so the pass is concurrent with the
+  // measured window. Main-thread metrics (the old code) stall frames here.
+  {
+    const fresh = await browser.newPage();
+    const freshIssues = [];
+    fresh.on('console', (m) => {
+      const t = m.type();
+      if (t === 'error' || t === 'warning') freshIssues.push(`${t}: ${m.text().slice(0, 300)}`);
+    });
+    fresh.on('pageerror', (e) => freshIssues.push(`pageerror: ${String(e.message || e).slice(0, 300)}`));
+    await fresh.goto(APP_URL, { waitUntil: 'networkidle2', timeout: 90000 });
+    const fMounted = await waitFor(fresh, () => !!document.querySelector('select'), 30000);
+    const fi = await fresh.$('#track-upload');
+    await fi.uploadFile(TONE);
+    // Engine ready AND decoded buffer present (play() silently no-ops without a buffer).
+    const fReady = await waitFor(fresh, () => {
+      try { const e = window.__NMP__.getEngine(); return e.isReady() && !!e.faustNode && !!e.getBuffer(); } catch { return false; }
+    }, 120000, 500);
+    await fresh.evaluate(INJECT_SNAPPER);
+    const fPlayed = await fresh.evaluate(async () => {
+      try {
+        const e = window.__NMP__.getEngine();
+        e.seek(0);
+        await e.play(); // async: awaits context.resume() before source.start()
+        return e.isPlaying;
+      } catch { return false; }
+    });
+    await sleep(10000);
+    const first10 = await fresh.evaluate(READ_SNAPPER);
+    check('fresh page: engine up + playback started', !!fMounted && fReady && fPlayed === true,
+      `mounted=${fMounted}, ready=${fReady}, playing=${fPlayed}`);
+    check('FPS first 10 s (metrics pass concurrent in worker): p95 <= 40 ms',
+      !!first10 && first10.p95 <= 40, JSON.stringify(first10));
+    check('fresh page: no console errors/warnings during the pass',
+      freshIssues.length === 0, freshIssues.slice(0, 3).join(' | '));
+    await fresh.evaluate(() => window.__NMP__.getEngine().stop());
+    await fresh.close();
+  }
+
+  // =========================================================================
+  section('M4.3c — Timeline slider freezes on pause');
+  // =========================================================================
+  {
+    // Drive ONLY through the UI transport button so React's isPlaying state
+    // and the engine stay in sync (a direct engine.play() would desync them).
+    const tp = () => page.evaluate(() => {
+      const b = document.querySelector('button.w-12.h-12');
+      if (!b || b.disabled) return false;
+      b.click();
+      return true;
+    });
+    const engPlaying = () => page.evaluate(() => window.__NMP__.getEngine().isPlaying);
+
+    const c1 = await tp(); // play
+    await sleep(1200);
+    const playingAfterPlay = await engPlaying();
+    const c2 = await tp(); // pause
+    await sleep(300);
+    const pausedAfterPause = await engPlaying();
+    const v1 = await h(page, 'seekBarValue');
+    await sleep(1500);
+    const v2 = await h(page, 'seekBarValue');
+    check('seek bar frozen on pause (1.5 s apart)',
+      c1 && c2 && playingAfterPlay === true && pausedAfterPause === false
+      && v1 !== null && v2 !== null && Math.abs(v1 - v2) < 1e-6,
+      `play=${c1} playing=${playingAfterPlay} pause=${c2} paused=${pausedAfterPause} v1=${v1} v2=${v2}`);
+    const c3 = await tp(); // resume
+    await sleep(800);
+    const v3 = await h(page, 'seekBarValue');
+    check('seek bar advances after resume', c3 && v3 !== null && v1 !== null && v3 > v1 + 0.3,
+      `v1=${v1}, v3=${v3}`);
+    await tp(); // stop
+    await sleep(200);
+  }
+
+  // =========================================================================
+  section('M4.5 — Pexels multi-clip export: cuts follow the audio peaks (synthetic, offline)');
+  // =========================================================================
+  // Two 1.2 s flat-color webm clips (red / blue) are generated IN the page
+  // (canvas captureStream + MediaRecorder — no network, no Pexels API).
+  // The DEV hook injects them as a ready selection, then an 8 s video export
+  // runs while a sampler reads the hidden export canvas' top-left quarter
+  // pixel (w/4, h/4) — the canvas center sits inside the cover-frame overlay.
+  // The master PCM is a steady 110/220/440 chord; findPeakCuePoints places
+  // each cue at the EXACT peak sample inside its 1 s window (1 s windows,
+  // min gap 3 s, 1 s edge margin), so the cue times are deterministic per
+  // signal but not round numbers. The export stores them in App state, and
+  // the sampler reads the live cues through the DEV hook
+  // (window.__NMP__.getExportBgCues) and samples CUE-RELATIVE points:
+  //   cue1−0.3 red | cue1..cue1+0.6 fade (mixed) | midpoint blue
+  //   | cue2+0.3 fade (mixed) | cue2+0.8 red.
+  {
+    const clipUrls = await page.evaluate(async () => {
+      const make = (style) => new Promise((resolve) => {
+        const c = document.createElement('canvas');
+        c.width = 320; c.height = 180;
+        const cx = c.getContext('2d');
+        cx.fillStyle = style; cx.fillRect(0, 0, 320, 180);
+        let frame = 0;
+        // A 2px dot marching along the top edge keeps the capture stream
+        // producing frames (a fully static canvas may record a single frame).
+        // It stays far from the sampled point (top-left quarter after cover-fit).
+        const tick = () => {
+          frame += 1;
+          cx.fillStyle = 'rgba(0,0,0,0.4)';
+          cx.fillRect((frame * 7) % 318, 0, 2, 2);
+        };
+        const stream = c.captureStream(30);
+        const iv = setInterval(tick, 100);
+        const rec = new MediaRecorder(stream, { mimeType: 'video/webm' });
+        const chunks = [];
+        rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+        rec.onstop = () => {
+          clearInterval(iv);
+          stream.getTracks().forEach((tr) => tr.stop());
+          resolve(URL.createObjectURL(new Blob(chunks, { type: 'video/webm' })));
+        };
+        rec.start(250);
+        setTimeout(() => rec.stop(), 1200);
+      });
+      const red = await make('rgb(220,20,30)');
+      const blue = await make('rgb(30,20,220)');
+      return [red, blue];
+    });
+    check('pexels: two synthetic clips generated (webm object URLs)',
+      Array.isArray(clipUrls) && clipUrls.length === 2 && clipUrls.every((u) => typeof u === 'string' && u.startsWith('blob:')),
+      `${clipUrls.length} urls`);
+
+    // The videoBgMode radios live inside the "Export Video" block — the
+    // checkbox must be on before they exist in the DOM.
+    const vidBoxOn = await page.evaluate(() => {
+      const cb = [...document.querySelectorAll('input[type="checkbox"]')]
+        .find((c) => c.parentElement.textContent.includes('Export Video'));
+      if (cb && !cb.checked) cb.click();
+      return !!cb;
+    });
+    await sleep(300);
+    const selOk = await page.evaluate((urls) => {
+      try {
+        return window.__NMP__.setPexelsTestSelection([
+          { url: urls[0], author: 'Red Author' },
+          { url: urls[1], author: 'Blue Author' },
+        ]);
+      } catch { return false; }
+    }, clipUrls);
+    const radioOk = await page.evaluate(() => {
+      const radios = [...document.querySelectorAll('input[type="radio"][name="videoBgMode"]')];
+      if (radios.length < 2) return false;
+      if (!radios[1].checked) radios[1].click();
+      return true;
+    });
+    await sleep(300);
+    check('pexels: test selection injected (DEV hook) + Pexels bg mode on',
+      selOk === true && radioOk,
+      `vidBoxOn=${vidBoxOn} selOk=${selOk} radioOk=${radioOk}`);
+
+    // Trim 0–8 s (START is still 0 from M3), video on, fast WAV audio.
+    await page.evaluate(() => {
+      const lab = [...document.querySelectorAll('label')].find((l) => l.textContent.trim().toUpperCase().startsWith('END'));
+      const inp = lab.parentElement.querySelector('input[type="number"]');
+      window.__h.inputSet(inp, 8);
+    });
+    await page.evaluate(() => {
+      const sel = [...document.querySelectorAll('select')].find((s) => [...s.options].some((o) => o.value === 'wav'));
+      window.__h.inputSet(sel, 'wav');
+    });
+    await page.evaluate(() => {
+      const cb = [...document.querySelectorAll('input[type="checkbox"]')]
+        .find((c) => c.parentElement.textContent.includes('Export Video'));
+      if (cb && !cb.checked) cb.click();
+    });
+    await sleep(300);
+
+    // Start the pixel sampler BEFORE clicking Export: the hidden export
+    // canvas only exists once isExportingVideo mounts, and the engine clock
+    // starts when the export seeks+plays. The sampler first waits for the
+    // export to compute its cues (DEV hook), then grabs pixels at fixed
+    // offsets from the ACTUAL cue times: cue1−0.3 (red, pre-fade), cue1+0.3
+    // (mid-fade mixed, alpha≈0.3–0.55), midpoint of the cues (blue — cues
+    // are ≥3 s apart, so the midpoint is ≥0.9 s from any fade edge),
+    // cue2+0.3 (mid-fade mixed), cue2+0.8 (red, post-fade). The grab window
+    // [target, target+0.2] tolerates the ≤1-frame canvas lag.
+    const samplerPromise = page.evaluate(async () => {
+      const e = window.__NMP__.getEngine();
+      // The export canvas sits inside AudioVisualizer's own wrapper div,
+      // which sits inside the fixed top:-9999px container — walk up.
+      const findCanvas = () => [...document.querySelectorAll('canvas')]
+        .find((c) => {
+          let el = c.parentElement;
+          while (el) {
+            if (el.style && el.style.top === '-9999px') return true;
+            el = el.parentElement;
+          }
+          return false;
+        });
+      const deadline = performance.now() + 45000;
+      let cues = null;
+      while (!cues && performance.now() < deadline) {
+        const c = window.__NMP__.getExportBgCues();
+        if (Array.isArray(c) && c.length >= 2) cues = c.slice();
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!cues) return { error: 'export cues never appeared (need >= 2)' };
+      let cv = null;
+      while (!cv && performance.now() < deadline) {
+        cv = findCanvas();
+        if (!cv) await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!cv) return { error: 'export canvas never mounted' };
+      const ctx = cv.getContext('2d');
+      // (w/4, h/4): outside the cover frame, title and credit overlays,
+      // which only occupy the bottom half / bottom-right corner.
+      const grab = () => Array.from(ctx.getImageData(cv.width >> 2, cv.height >> 2, 1, 1).data);
+      const mid = (cues[0] + cues[1]) / 2;
+      const targets = { a: cues[0] - 0.3, b: cues[0] + 0.3, c: mid, d: cues[1] + 0.3, e: cues[1] + 0.8 };
+      const out = {
+        cues: cues.map((x) => +x.toFixed(3)),
+        a: null, b: null, c: null, d: null, e: null,
+        canvasW: cv.width, canvasH: cv.height, maxT: 0,
+      };
+      while (performance.now() < deadline) {
+        const t = e.getCurrentTime();
+        out.maxT = Math.max(out.maxT, t);
+        for (const k of ['a', 'b', 'c', 'd', 'e']) {
+          if (!out[k] && t >= targets[k] && t <= targets[k] + 0.2) out[k] = grab();
+        }
+        if (out.a && out.b && out.c && out.d && out.e) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return out;
+    });
+
+    const mClicked = await h(page, 'clickText', 'Export');
+    const mdl = await awaitDownload(page, 180000);
+    const samples = await samplerPromise;
+    const isRed = (px) => Array.isArray(px) && px[0] > 150 && px[2] < 100;
+    const isBlue = (px) => Array.isArray(px) && px[2] > 150 && px[0] < 100;
+    const isMixed = (px) => Array.isArray(px)
+      && px[0] > 60 && px[0] < 200 && px[2] > 60 && px[2] < 200
+      && Math.abs(px[0] - 220) > 30 && Math.abs(px[2] - 220) > 30;
+    const cueInfo = Array.isArray(samples.cues) ? `cues=[${samples.cues}]` : `err=${samples.error || 'no samples'}`;
+    check('pexels cut: before cue #1 shows clip #1 (red)', isRed(samples.a), `${cueInfo} px=${JSON.stringify(samples.a)}`);
+    check('pexels cut: mid-crossfade after cue #1 (mixed)', isMixed(samples.b), `px=${JSON.stringify(samples.b)}`);
+    check('pexels cut: between cues shows clip #2 (blue)', isBlue(samples.c), `px=${JSON.stringify(samples.c)}`);
+    check('pexels cut: mid-crossfade after cue #2 (mixed)', isMixed(samples.d), `px=${JSON.stringify(samples.d)}`);
+    check('pexels cut: after cue #2 back to clip #1 (red)', isRed(samples.e), `px=${JSON.stringify(samples.e)}`);
+    let mOk = false;
+    let mDetail = 'no download';
+    if (mdl) {
+      const isWebm = mdl.buf.readUInt32LE(0) === 0x1a45dfa3;
+      const isMp4 = mdl.buf.length > 8 && mdl.buf.toString('ascii', 4, 8) === 'ftyp';
+      const dur = isWebm ? parseWebmDurationMs(mdl.buf) : null;
+      mOk = (isWebm || isMp4) && mdl.buf.length > 100000
+        && (isMp4 || (dur !== null && Math.abs(dur / 1000 - 8) < 1.5));
+      mDetail = `${mdl.name} ${mdl.buf.length} B, isWebm=${isWebm}, isMp4=${isMp4}, dur=${dur !== null ? (dur / 1000).toFixed(2) + 's' : 'n/a'}`;
+    }
+    check('pexels video export (container + duration ~= 8 s)', mClicked && mOk, mDetail);
+
+    // Cleanliness: back to the visualizer background, selection cleared.
+    await page.evaluate(() => {
+      const radios = [...document.querySelectorAll('input[type="radio"][name="videoBgMode"]')];
+      if (radios[0] && !radios[0].checked) radios[0].click();
+      const cb = [...document.querySelectorAll('input[type="checkbox"]')]
+        .find((c) => c.parentElement.textContent.includes('Export Video'));
+      if (cb && cb.checked) cb.click();
+      try { window.__NMP__.setPexelsTestSelection([]); } catch { /* dev-only */ }
+    });
+    await sleep(300);
   }
 
   // =========================================================================

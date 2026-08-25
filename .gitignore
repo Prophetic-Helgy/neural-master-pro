@@ -48,6 +48,7 @@ test-reverb2.dsp
 docs/screenshots/tone_test.wav
 # e2e / fps-measure regenerate these at runtime
 docs/screenshots/e2e_*.wav
+docs/screenshots/e2e_cover_wide.png
 docs/screenshots/fps_tone.wav
 test-api.mjs
 test_getparams.mjs

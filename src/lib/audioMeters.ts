@@ -944,3 +944,79 @@ export class LoudnessMeter {
     this.count = 0;
   }
 }
+
+// ---------------------------------------------------------------------------
+// findPeakCuePoints — deterministic "cut at the audio peak" cues for the
+// multi-clip video export (Pexels b-roll). The region is split into
+// 1-second windows (same grid as the timeline analysis); each window is
+// scored by peak amplitude, the strongest windows are picked greedily with
+// a refractory gap (minGapSec), and each cue lands on the argmax sample of
+// its window — the actual peak, not the window start. No cues inside
+// edgeMarginSec of the region edges. Ties break toward the earlier time,
+// so the output is deterministic. [] on silence or too-short regions.
+// ---------------------------------------------------------------------------
+
+export interface PeakCueOptions {
+  /** Window length in seconds (default 1). */
+  windowSec?: number;
+  /** Minimum distance between adjacent cues in seconds (default 3). */
+  minGapSec?: number;
+  /** Zone around the region edges that receives no cues, in seconds (default 1). */
+  edgeMarginSec?: number;
+  /** Hard cap on the number of cues (e.g. the number of selected clips). */
+  maxCues?: number;
+}
+
+export function findPeakCuePoints(
+  left: Float32Array,
+  right: Float32Array | null,
+  sampleRate: number,
+  regionStart: number,
+  regionEnd: number,
+  opts: PeakCueOptions = {}
+): number[] {
+  const windowSec = opts.windowSec ?? 1;
+  const minGapSec = opts.minGapSec ?? 3;
+  const edgeMarginSec = opts.edgeMarginSec ?? 1;
+  const maxCues = opts.maxCues;
+  const sr = Math.max(1, Math.floor(sampleRate));
+  const win = Math.max(1, Math.floor(windowSec * sr));
+  const len = regionEnd - regionStart;
+  if (!left || left.length === 0 || len <= edgeMarginSec * 2) return [];
+  const iStart = Math.max(0, Math.floor(regionStart * sr));
+  const iEnd = Math.min(left.length, Math.floor(regionEnd * sr));
+  const lo = iStart + Math.floor(edgeMarginSec * sr);
+  const hi = iEnd - Math.floor(edgeMarginSec * sr);
+  if (hi - lo < win) return [];
+
+  // Score every 1-s window: peak amplitude + argmax offset inside it.
+  const windows: { t: number; energy: number }[] = [];
+  for (let w0 = lo; w0 + win <= hi; w0 += win) {
+    let peak = 0;
+    let peakOff = 0;
+    for (let off = 0; off < win; off += 1) {
+      const i = w0 + off;
+      const a = Math.abs(left[i]);
+      const b = right ? Math.abs(right[i]) : 0;
+      const v = a > b ? a : b;
+      if (v > peak) { peak = v; peakOff = off; }
+    }
+    if (peak <= 1e-6) continue; // silent window
+    windows.push({ t: (w0 + peakOff) / sr, energy: peak });
+  }
+  if (windows.length === 0) return [];
+
+  // Greedy: strongest first, ties toward the earlier time.
+  windows.sort((a, b) => (b.energy !== a.energy ? b.energy - a.energy : a.t - b.t));
+  const picked: number[] = [];
+  for (const w of windows) {
+    if (maxCues !== undefined && picked.length >= maxCues) break;
+    let tooClose = false;
+    for (const p of picked) {
+      if (Math.abs(p - w.t) < minGapSec) { tooClose = true; break; }
+    }
+    if (!tooClose) picked.push(w.t);
+  }
+  picked.sort((a, b) => a - b);
+  return picked;
+}

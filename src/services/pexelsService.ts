@@ -11,6 +11,10 @@ import { PexelsClip, PexelsVideoFile } from '../types';
 const DEFAULT_PEXELS_KEY = '[REMOVED-PEXELS-KEY]';
 const API_BASE = 'https://api.pexels.com/v1';
 const KEY_STORAGE = 'nmp_pexels_key';
+// Max background clips per export. Each clip runs a full <video> decoder,
+// so 4 x 1080p is comfortable; 4 x 4K at 60 fps is at the edge of what a
+// mid-range GPU sustains (the manual-check case, documented in the README).
+export const MAX_PEXELS_CLIPS = 4;
 const MIN_CLIP_SIZE = 10000; // bytes — anything smaller is treated as a broken download
 const CACHE_MAX_FILES = 20;
 const SEARCH_TTL_MS = 24 * 3600 * 1000;

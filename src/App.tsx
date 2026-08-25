@@ -26,7 +26,7 @@ import {
 import { AudioEngine } from './lib/AudioEngine';
 import { encodeAudio } from './lib/exportEncoders';
 import { i18n } from './lib/i18n';
-import { Language, MasteringSettings, TrackMetadata, ExportFormat, ExportQuality, AudioSnapshot, EffectRegion, TargetStem, PexelsClip, PexelsVideoFile } from './types';
+import { Language, MasteringSettings, TrackMetadata, ExportFormat, ExportQuality, AudioSnapshot, EffectRegion, TargetStem, PexelsClip, PexelsVideoFile, PexelsSelectionItem } from './types';
 import type { PipelineMetrics } from './lib/audioMeters';
 import { AudioVisualizer } from './components/AudioVisualizer';
 import { MasteringControl } from './components/MasteringControl';
@@ -34,7 +34,8 @@ import { MeteringBridge } from './components/MeteringBridge';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
 import { LiteMaster } from './components/LiteMaster';
 import { getAutoMasterSettings } from './services/geminiService';
-import { searchPexelsVideos, pickBestRendition, ensureClipBlob, PexelsApiError } from './services/pexelsService';
+import { searchPexelsVideos, pickBestRendition, ensureClipBlob, PexelsApiError, MAX_PEXELS_CLIPS } from './services/pexelsService';
+import { findPeakCuePoints } from './lib/audioMeters';
 import { loadLlmConfig, saveLlmConfig, llmAutoMaster, llmAiReport, LlmConfig, LlmError } from './services/llmService';
 import { LlmSettingsModal } from './components/LlmSettingsModal';
 import { clsx, type ClassValue } from 'clsx';
@@ -217,6 +218,8 @@ const TimeControls: React.FC<{
   useEffect(() => {
     const interval = setInterval(() => {
       const eng = engineRef.current;
+      // getCurrentTime() returns a frozen offset while paused (the engine
+      // snapshots it in stop()), so the slider holds its position.
       if (eng) setTime(eng.getCurrentTime());
     }, 100);
     return () => clearInterval(interval);
@@ -321,6 +324,14 @@ export default function App() {
     return () => clearInterval(checkReady);
   }, []);
   const [coverArt, setCoverArt] = useState<string | null>(null);
+  // Pan of the cover inside its frame: -1..1 per axis (0 = center). Only the
+  // overflowing axis is active (depends on the image aspect). Stored
+  // normalized so the same value drives the UI preview and the export
+  // drawImage. Reset on every new cover.
+  const [coverOffset, setCoverOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [coverAspect, setCoverAspect] = useState(1);
+  const coverDragRef = useRef<{ id: number; sx: number; sy: number; ox: number; oy: number; maxPxX: number; maxPxY: number } | null>(null);
+  const coverDragMovedRef = useRef(false);
 
   // New states
   const [monitorVolume, setMonitorVolume] = useState(1);
@@ -331,6 +342,9 @@ export default function App() {
   const logoRef = useRef<HTMLImageElement>(null);
   const [effectRegions, setEffectRegions] = useState<EffectRegion[]>([]);
   const [activeFXRegionId, setActiveFXRegionId] = useState<string | null>(null);
+  // Guards the async metrics pass: a stale .then/.finally must not clear the
+  // busy flag (or metrics) of a newer track.
+  const measureGenRef = useRef(0);
 
   const neonColors = ['#00ffff', '#ff00ff', '#00ffaa', '#ffff00', '#ff00aa'];
 
@@ -386,11 +400,14 @@ export default function App() {
   useEffect(() => {
     let frame: number;
     let prevVal = 0;
+    // Allocated once per effect run — a fresh Uint8Array per frame was GC churn
+    let timeData: Uint8Array | null = null;
     const pulseLogo = () => {
       if (isPlaying && logoRef.current && audioEngine.current) {
         const analysers = audioEngine.current.getAnalysers();
         if (analysers && analysers.L) {
-          const timeData = new Uint8Array(analysers.L.frequencyBinCount);
+          const need = analysers.L.frequencyBinCount;
+          if (!timeData || timeData.length !== need) timeData = new Uint8Array(need);
           analysers.L.getByteTimeDomainData(timeData);
 
           let localRms = 0;
@@ -537,33 +554,52 @@ export default function App() {
   // closure over one render — must read the nodes through refs, not stale state.
   const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isExportingVideo, setIsExportingVideo] = useState(false);
+  // Cut-point times (seconds from export start) for the multi-clip Pexels
+  // background — set by handleExport right before the export canvas mounts.
+  const [exportBgCues, setExportBgCues] = useState<number[]>([]);
+  // Ref mirror for the DEV hook (the hook closure is created once in a
+  // mount-only effect, so it can only read refs, not render-fresh state).
+  const exportBgCuesRef = useRef<number[]>([]);
+  // Audio clock for the cue math: track position minus the export start.
+  const pexelsBgGetTime = () => Math.max(0, (audioEngine.current?.getCurrentTime() ?? 0) - exportStartRef.current);
 
-  // Pexels stock-video background states
+  // Pexels stock-video background states. Multi-clip: up to MAX_PEXELS_CLIPS
+  // clips, rotation order = selection order (badge #1..#N in the UI).
   const [videoBgMode, setVideoBgMode] = useState<'visualizer' | 'pexels'>('visualizer');
   const [pexelsQuery, setPexelsQuery] = useState('');
   const [pexelsResults, setPexelsResults] = useState<PexelsClip[]>([]);
   const [pexelsSearching, setPexelsSearching] = useState(false);
-  const [selectedClip, setSelectedClip] = useState<PexelsClip | null>(null);
-  const [selectedFile, setSelectedFile] = useState<PexelsVideoFile | null>(null);
-  const [clipDl, setClipDl] = useState<{ s: 'idle' | 'downloading' | 'ready' | 'error'; p: number }>({ s: 'idle', p: 0 });
-  const [pexelsClipUrl, setPexelsClipUrl] = useState<string | null>(null);
+  const [pexelsSelection, setPexelsSelection] = useState<PexelsSelectionItem[]>([]);
   const [pexelsError, setPexelsError] = useState<string | null>(null);
   const [showCredit, setShowCredit] = useState(true);
-  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
-  const pendingDownloadRef = useRef<Promise<string | null> | null>(null);
-  const pexelsClipUrlRef = useRef<string | null>(null);
+  // Refs: handleExport is an async closure over one render, so it reads the
+  // selection through refs (same reason as exportCanvasRef above).
+  const pexelsSelectionRef = useRef<PexelsSelectionItem[]>([]);
+  const clipUrlMapRef = useRef<Map<number, string>>(new Map()); // clipId -> object URL (revocation)
+  const selectionIdsRef = useRef<Set<number>>(new Set()); // selected clip ids, updated BEFORE state (in-flight guard)
+  const clipDownloadQueueRef = useRef<Promise<unknown>>(Promise.resolve()); // sequential downloads (429-safe)
+  const bgVideosRef = useRef<HTMLVideoElement[]>([]);
+  const exportStartRef = useRef(0); // seconds of track time at the export start (audio clock origin)
 
   const audioEngine = useRef<AudioEngine | null>(null);
   const t = i18n[lang];
 
-  // Keep the latest object URL in a ref so unmount cleanup revokes the right one
   useEffect(() => {
-    pexelsClipUrlRef.current = pexelsClipUrl;
-  }, [pexelsClipUrl]);
+    pexelsSelectionRef.current = pexelsSelection;
+    selectionIdsRef.current = new Set(pexelsSelection.map((s) => s.clip.id));
+  }, [pexelsSelection]);
 
+  // Revoke every clip object URL on unmount.
   useEffect(() => () => {
-    if (pexelsClipUrlRef.current) URL.revokeObjectURL(pexelsClipUrlRef.current);
+    clipUrlMapRef.current.forEach((url) => URL.revokeObjectURL(url));
+    clipUrlMapRef.current.clear();
   }, []);
+
+  // Derived (recomputed each render — the export JSX reads these, not the
+  // handleExport closure's locals).
+  const pexelsReadyItems = pexelsSelection.filter((s) => s.status === 'ready' && s.url);
+  const pexelsReadyUrls = pexelsReadyItems.map((s) => s.url as string);
+  const pexelsCreditNames = [...new Set(pexelsReadyItems.map((s) => s.clip.user.name))];
 
   useEffect(() => {
     audioEngine.current = new AudioEngine();
@@ -585,6 +621,31 @@ export default function App() {
       (window as unknown as Record<string, unknown>).__NMP__ = {
         getEngine: () => audioEngine.current,
         getNeutralSettings: () => ({ ...NEUTRAL_SETTINGS }),
+        // M4.5: live cut-point cues of the in-flight (or last) video export.
+        getExportBgCues: () => exportBgCuesRef.current,
+        resetCoverOffset: () => { setCoverOffset({ x: 0, y: 0 }); return true; },
+        // M4.5 (multi-clip Pexels export): injects fake "ready" selection
+        // items pointing at in-page object URLs (synthetic webm clips), so
+        // the whole cue/crossfade export path runs offline. [] clears.
+        setPexelsTestSelection: (items: Array<{ url: string; author: string }>) => {
+          clipUrlMapRef.current.forEach((url) => URL.revokeObjectURL(url));
+          clipUrlMapRef.current.clear();
+          selectionIdsRef.current.clear();
+          const sel: PexelsSelectionItem[] = (items || []).map((it, i) => {
+            const id = 9000 + i;
+            const url = it.url || null;
+            if (url) clipUrlMapRef.current.set(id, url);
+            return {
+              clip: { id, duration: 10, image: '', user: { name: it.author || 'Test Author', url: '' }, video_files: [] },
+              file: { id, quality: 'hd', file_type: 'video/webm', width: 640, height: 360, fps: 30, link: it.url || '', size: 999999 },
+              url,
+              status: url ? 'ready' : 'error',
+              progress: 1,
+            };
+          });
+          setPexelsSelection(sel);
+          return true;
+        },
       };
     }
   }, []);
@@ -637,18 +698,14 @@ export default function App() {
         setMetadata(prev => ({ ...prev, title: file.name.split('.')[0] }));
       }
 
-      // Defer the heavy true-peak/LUFS pass (4× 256-tap FIR over the whole
-      // buffer, run as setTimeout(0) chunks) ~2 s after upload: firing it
-      // immediately landed those chunks on the main thread at exactly the
-      // moment playback starts — the first-seconds stutter.
-      const measureBuf = audioEngine.current.getBuffer();
-      setTimeout(() => {
-        const eng = audioEngine.current;
-        if (!eng || eng.getBuffer() !== measureBuf) return; // track swapped meanwhile
-        eng.measureTrack(measureBuf)
-          .then(m => { if (m) setTrackMetrics(m); })
-          .finally(() => setTrackMetricsBusy(false));
-      }, 2000);
+      // The heavy true-peak/LUFS/tone pass (4× 256-tap FIR over the whole
+      // buffer) runs in a web worker — it no longer touches the main thread,
+      // so it can start immediately without stuttering playback start.
+      audioEngine.current.cancelMeasure(); // drop any pass for a previous track
+      const measureGen = ++measureGenRef.current;
+      audioEngine.current.measureTrack(audioEngine.current.getBuffer())
+        .then(m => { if (measureGen === measureGenRef.current && m) setTrackMetrics(m); })
+        .finally(() => { if (measureGen === measureGenRef.current) setTrackMetricsBusy(false); });
     }
   };
 
@@ -676,18 +733,72 @@ export default function App() {
     if (file) {
       const reader = new FileReader();
       reader.onload = (ev) => {
-        setCoverArt(ev.target?.result as string);
+        const url = ev.target?.result as string;
+        setCoverArt(url);
+        setCoverOffset({ x: 0, y: 0 });
+        setCoverAspect(1);
+        // Probe the natural size so we know whether panning is possible
+        // (object-cover overflow only exists when aspect != 1:1).
+        const probe = new Image();
+        probe.onload = () => {
+          if (probe.naturalWidth > 0 && probe.naturalHeight > 0) {
+            setCoverAspect(probe.naturalWidth / probe.naturalHeight);
+          }
+        };
+        probe.src = url;
       };
       reader.readAsDataURL(file);
     }
   };
+
+  // Drag-to-pan the cover inside the frame. The drag math works in pixels
+  // (maxPxX/Y = the object-cover overflow for the current box size), but the
+  // result is stored normalized (-1..1) and rendered as a % transform of the
+  // square element — so it is independent of box size and re-scales on
+  // resize.
+  const coverDragPossible = coverArt !== null && coverAspect !== 1;
+  const onCoverPointerDown = (e: React.PointerEvent<HTMLImageElement>) => {
+    if (!coverDragPossible) return;
+    const el = e.currentTarget;
+    const S = el.clientWidth;
+    const maxPxX = coverAspect > 1 ? (S * (coverAspect - 1)) / 2 : 0;
+    const maxPxY = coverAspect < 1 ? (S * (1 - coverAspect)) / (2 * coverAspect) : 0;
+    if (maxPxX === 0 && maxPxY === 0) return;
+    coverDragMovedRef.current = false;
+    coverDragRef.current = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: coverOffset.x, oy: coverOffset.y, maxPxX, maxPxY };
+    try {
+      el.setPointerCapture(e.pointerId);
+    } catch {
+      // Synthetic or already-lost pointer: the drag still works because the
+      // events are dispatched on the element itself.
+    }
+  };
+  const onCoverPointerMove = (e: React.PointerEvent<HTMLImageElement>) => {
+    const d = coverDragRef.current;
+    if (!d || d.id !== e.pointerId) return;
+    const dx = e.clientX - d.sx;
+    const dy = e.clientY - d.sy;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) coverDragMovedRef.current = true;
+    const nx = d.maxPxX > 0 ? Math.max(-1, Math.min(1, d.ox + dx / d.maxPxX)) : 0;
+    const ny = d.maxPxY > 0 ? Math.max(-1, Math.min(1, d.oy + dy / d.maxPxY)) : 0;
+    setCoverOffset({ x: nx, y: ny });
+  };
+  const onCoverPointerUp = (e: React.PointerEvent<HTMLImageElement>) => {
+    if (coverDragRef.current?.id === e.pointerId) coverDragRef.current = null;
+  };
+  // Preview transform as % of the square element: overflow fraction of the
+  // box is (aspect-1)/2 horizontally (wide) or (1-aspect)/(2*aspect)
+  // vertically (tall).
+  const coverTransform = coverArt && coverAspect !== 1
+    ? `translate(${coverAspect > 1 ? (coverOffset.x * (coverAspect - 1)) / 2 * 100 : 0}%, ${coverAspect < 1 ? (coverOffset.y * (1 - coverAspect)) / (2 * coverAspect) * 100 : 0}%)`
+    : undefined;
 
   const togglePlayback = () => {
     if (!audioEngine.current || !track) return;
     if (isPlaying) {
       audioEngine.current.stop();
     } else {
-      audioEngine.current.play();
+      void audioEngine.current.play();
     }
     setIsPlaying(!isPlaying);
   };
@@ -830,8 +941,17 @@ export default function App() {
   };
 
   const handleReset = () => {
+    // Reset = everything inside the Pro panel block: the 81 module params,
+    // the active save-slot, FX automation regions and A/B monitoring.
+    // Track, trim, cover, metadata, reference and export options stay.
     setSettings(NEUTRAL_SETTINGS);
     audioEngine.current?.updateSettings(NEUTRAL_SETTINGS);
+    setActivePresetIndex(1);
+    setEffectRegions([]);
+    // Without this the five FX sliders would stay in region-edit mode
+    // (header "(Editing Area)") pointing at a region that no longer exists.
+    setActiveFXRegionId(null);
+    setMonitoring('master');
   };
 
   const handlePresetClick = (num: number) => {
@@ -858,17 +978,20 @@ export default function App() {
   const expW = isVert ? baseW : baseH;
   const expH = isVert ? baseH : baseW;
 
+  const clearPexelsSelection = () => {
+    // Revoke happens here (outside any state updater — StrictMode double-runs
+    // updaters in dev), guarded by the map so a double call is a no-op.
+    clipUrlMapRef.current.forEach((url) => URL.revokeObjectURL(url));
+    clipUrlMapRef.current.clear();
+    // Immediate: in-flight .then callbacks check this before creating URLs.
+    selectionIdsRef.current.clear();
+    setPexelsSelection([]);
+  };
+
   const resetPexelsSelection = () => {
-    setSelectedClip(null);
-    setSelectedFile(null);
+    clearPexelsSelection();
     setPexelsResults([]);
     setPexelsError(null);
-    setClipDl({ s: 'idle', p: 0 });
-    pendingDownloadRef.current = null;
-    if (pexelsClipUrl) {
-      URL.revokeObjectURL(pexelsClipUrl);
-      setPexelsClipUrl(null);
-    }
   };
 
   const runPexelsSearch = async () => {
@@ -890,35 +1013,67 @@ export default function App() {
     }
   };
 
-  const handleClipSelect = (clip: PexelsClip) => {
+  // Enqueue one clip download in the sequential queue (one fetch at a time —
+  // Pexels rate-limits parallel requests with 429; ensureClipBlob still
+  // dedupes by link hash and uses the file cache). Used by both first select
+  // and per-card Retry.
+  const queueClipDownload = (clip: PexelsClip, file: PexelsVideoFile) => {
+    selectionIdsRef.current.add(clip.id);
+    setPexelsSelection((prev) =>
+      prev.some((s) => s.clip.id === clip.id)
+        ? prev.map((s) => (s.clip.id === clip.id ? { ...s, file, status: 'downloading', progress: 0 } : s))
+        : [...prev, { clip, file, url: null, status: 'downloading', progress: 0 }]
+    );
+    setPexelsError(null);
+    clipDownloadQueueRef.current = clipDownloadQueueRef.current
+      .catch(() => { /* a failed download must not poison the rest of the queue */ })
+      .then(() => ensureClipBlob(file, (p) => {
+        if (!selectionIdsRef.current.has(clip.id)) return; // deselected while queued
+        setPexelsSelection((prev) => prev.map((s) => (s.clip.id === clip.id ? { ...s, progress: p } : s)));
+      }))
+      .then((blob) => {
+        if (!selectionIdsRef.current.has(clip.id)) return; // deselected mid-download
+        const url = URL.createObjectURL(blob);
+        clipUrlMapRef.current.set(clip.id, url);
+        setPexelsSelection((prev) => prev.map((s) => (s.clip.id === clip.id ? { ...s, url, status: 'ready', progress: 1 } : s)));
+      })
+      .catch((e: any) => {
+        const msg = e instanceof PexelsApiError ? ((t as any).pexelsError || 'Pexels error: {code}').replace('{code}', e.code) : (e?.message || 'Download failed');
+        setPexelsError(msg);
+        setPexelsSelection((prev) => prev.map((s) => (s.clip.id === clip.id ? { ...s, status: 'error' } : s)));
+      });
+  };
+
+  const handleClipToggle = (clip: PexelsClip) => {
+    const selected = pexelsSelection.find((s) => s.clip.id === clip.id);
+    if (selected) {
+      const url = clipUrlMapRef.current.get(clip.id);
+      if (url) URL.revokeObjectURL(url);
+      clipUrlMapRef.current.delete(clip.id);
+      selectionIdsRef.current.delete(clip.id);
+      setPexelsSelection((prev) => prev.filter((s) => s.clip.id !== clip.id));
+      return;
+    }
     const file = pickBestRendition(clip.video_files, expW, expH);
     if (!file) {
       setPexelsError('No usable video file for this clip');
       return;
     }
-    setSelectedClip(clip);
-    setSelectedFile(file);
-    setPexelsError(null);
-    setClipDl({ s: 'downloading', p: 0 });
-    if (pexelsClipUrl) {
-      URL.revokeObjectURL(pexelsClipUrl);
-      setPexelsClipUrl(null);
+    if (pexelsSelection.length >= MAX_PEXELS_CLIPS) {
+      setPexelsError(((t as any).maxClips || 'Max {n} clips — deselect one first').replace('{n}', String(MAX_PEXELS_CLIPS)));
+      return;
     }
-    // All async work lives in the click handler (StrictMode-safe, no useEffect fetches)
-    const p = ensureClipBlob(file, prog => setClipDl({ s: 'downloading', p: prog }))
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        setPexelsClipUrl(url);
-        setClipDl({ s: 'ready', p: 1 });
-        return url;
-      })
-      .catch((e: any) => {
-        setClipDl({ s: 'error', p: 0 });
-        const msg = e instanceof PexelsApiError ? ((t as any).pexelsError || 'Pexels error: {code}').replace('{code}', e.code) : (e?.message || 'Download failed');
-        setPexelsError(msg);
-        return null;
-      });
-    pendingDownloadRef.current = p;
+    queueClipDownload(clip, file);
+  };
+
+  const handleClipRetry = (clip: PexelsClip) => {
+    const item = pexelsSelection.find((s) => s.clip.id === clip.id);
+    const file = item?.file ?? pickBestRendition(clip.video_files, expW, expH);
+    if (!file) {
+      setPexelsError('No usable video file for this clip');
+      return;
+    }
+    queueClipDownload(clip, file);
   };
 
   const downloadBlob = (blob: Blob, filename: string) => {
@@ -939,11 +1094,16 @@ export default function App() {
     try {
       const fileNameBase = metadata.title || 'master';
 
+      // The offline master mix, rendered at most once: the audio export uses
+      // it directly, and the Pexels cue pass (below) reuses it instead of
+      // rendering the trim a second time.
+      let masterPcm: { left: Float32Array; right: Float32Array; sampleRate: number } | null = null;
+
       if (exportAudio) {
         // Offline Faust render → shared encoder (dithered WAV / MP3 / FLAC / AAC + metadata).
-        const pcm = await audioEngine.current.renderProPcm(settings, Number(trimStart) || 0, Number(trimEnd) || 0, effectRegions);
-        if (!pcm) throw new Error('Pro render failed — engine not ready');
-        const enc = await encodeAudio(pcm.left, pcm.right, pcm.sampleRate, {
+        masterPcm = await audioEngine.current.renderProPcm(settings, Number(trimStart) || 0, Number(trimEnd) || 0, effectRegions);
+        if (!masterPcm) throw new Error('Pro render failed — engine not ready');
+        const enc = await encodeAudio(masterPcm.left, masterPcm.right, masterPcm.sampleRate, {
           format: exportFormat,
           bitDepth: exportFormat === 'wav' ? proWavBit : undefined,
           aacKbps: exportFormat === 'aac' ? aacKbps : undefined,
@@ -953,6 +1113,38 @@ export default function App() {
       }
 
       if (exportVideo) {
+        // Honor the trim region: start at trimStart, record to trimEnd (capped at track end).
+        // Computed FIRST: the Pexels cue pass below needs the region length.
+        const recStart = Math.min(Number(trimStart) || 0, duration);
+        const recEnd = Math.min(Number(trimEnd) || 0, duration) || duration;
+        const recLenSec = Math.max(0, recEnd - recStart);
+
+        // Pexels multi-clip background: drain the download queue (clips still
+        // fetching), then compute the cut cues from the MASTER mix PCM — the
+        // exact audio that lands in the export. 2+ ready clips → cues; 1 clip
+        // → single loop; 0 → the plain visualizer (readyVids guard in the
+        // draw loop degrades on the fly).
+        const isPexelsBg = videoBgMode === 'pexels';
+        if (isPexelsBg) {
+          await clipDownloadQueueRef.current.catch(() => {});
+        }
+        const readySel = isPexelsBg
+          ? pexelsSelectionRef.current.filter((s) => s.status === 'ready' && s.url)
+          : [];
+        let bgCues: number[] = [];
+        if (readySel.length >= 2) {
+          const pcm = masterPcm ?? await audioEngine.current.renderProPcm(
+            settings, Number(trimStart) || 0, Number(trimEnd) || 0, effectRegions
+          );
+          if (pcm) {
+            const regionSec = Math.min(recLenSec, pcm.left.length / pcm.sampleRate);
+            bgCues = findPeakCuePoints(pcm.left, pcm.right, pcm.sampleRate, 0, regionSec);
+          }
+        }
+        setExportBgCues(bgCues);
+        exportBgCuesRef.current = bgCues;
+        exportStartRef.current = recStart;
+
         // Mount the hidden high-res canvas only for the duration of the export.
         // It was always-mounted before: up to a 2160×3840 canvas drawing every
         // frame during normal playback (the visualizer rendered twice).
@@ -971,29 +1163,24 @@ export default function App() {
         }
         const exportCanvas = exportCanvasRef.current;
 
-        // Wait for the Pexels background clip to finish downloading
-        if (pendingDownloadRef.current) {
-          await pendingDownloadRef.current;
-        }
-
-        // Pexels background: seek to 0 and wait for the first frame (up to 8s),
-        // BEFORE the audio starts — otherwise the clip and the track desync.
-        // The <video> element appears when the URL state lands (may arrive
-        // during this wait — the ref is refreshed by onBgVideoReady).
-        // If it never becomes ready, the draw loop simply skips the video frame
-        // (readyState guard), so the export degrades to the visualizer only.
-        if (videoBgMode === 'pexels' && pexelsClipUrl) {
+        // Pexels backgrounds: wait for first frames (up to 8 s) BEFORE the
+        // audio starts — otherwise the clips and the track desync. The
+        // <video> elements are created by the visualizer effect once the
+        // export canvas mounts and are reported via onBgVideosReady. A clip
+        // that never becomes ready drops out of the rotation inside the
+        // visualizer (readyVids filter); the cues stay valid for the rest.
+        if (readySel.length > 0) {
           const waitStart = Date.now();
-          let bg = bgVideoRef.current;
-          while ((!bg || bg.readyState < 2) && Date.now() - waitStart < 8000) {
+          while (
+            (bgVideosRef.current.length < readySel.length || bgVideosRef.current.some((v) => v.readyState < 2))
+            && Date.now() - waitStart < 8000
+          ) {
             await new Promise(r => setTimeout(r, 100));
-            bg = bgVideoRef.current;
           }
-          if (bg && bg.readyState >= 1) bg.currentTime = 0;
-          bg?.play().catch(() => {});
-          if (!bg || bg.readyState < 2) {
-            console.warn('[NMP] Pexels background not ready in 8s — exporting visualizer only');
-          }
+          bgVideosRef.current.forEach((v) => {
+            if (v.readyState >= 1) v.currentTime = 0;
+            v.play().catch(() => {});
+          });
         }
 
         // Record the processed MASTER regardless of the current monitor/bypass —
@@ -1004,13 +1191,9 @@ export default function App() {
           await new Promise(r => setTimeout(r, 150)); // let the 20 ms switch gains settle
         }
 
-        // Honor the trim region: start at trimStart, record to trimEnd (capped at track end).
-        const recStart = Math.min(Number(trimStart) || 0, duration);
-        const recEnd = Math.min(Number(trimEnd) || 0, duration) || duration;
-        const recLenSec = Math.max(0, recEnd - recStart);
-
         audioEngine.current.seek(recStart);
-        audioEngine.current.play();
+        // The context must be fully running before captureStream/record
+        await audioEngine.current.play();
         setIsPlaying(true);
 
         const dest = audioEngine.current.getAudioContext().createMediaStreamDestination();
@@ -1095,7 +1278,7 @@ export default function App() {
         await new Promise(r => setTimeout(r, ms + 100)); // wait for the trimmed region to play
 
         recorder.stop();
-        bgVideoRef.current?.pause();
+        bgVideosRef.current.forEach((v) => v.pause());
         // With trimEnd < track end the source is still playing — stop it and
         // restore the user's monitor mode.
         audioEngine.current.stop();
@@ -1131,14 +1314,19 @@ export default function App() {
             analyser={audioEngine.current?.getAnalysers()?.L || null}
             mode={visMode}
             coverArt={coverArt || './logo_Neural Master Pro.png'}
+            coverOffset={coverOffset}
             width={expW}
             height={expH}
             exportMode={true}
             metadata={metadata}
             onCanvasReady={(c) => { exportCanvasRef.current = c; }}
-            bgVideoUrl={videoBgMode === 'pexels' ? pexelsClipUrl : null}
-            creditText={videoBgMode === 'pexels' && showCredit && selectedClip ? `${(t as any).videoAuthor || 'Video:'} Pexels / ${selectedClip.user.name}` : null}
-            onBgVideoReady={(v) => { bgVideoRef.current = v; }}
+            bgVideoUrls={videoBgMode === 'pexels' ? pexelsReadyUrls : null}
+            bgCueTimes={videoBgMode === 'pexels' ? exportBgCues : null}
+            bgGetTime={pexelsBgGetTime}
+            creditText={videoBgMode === 'pexels' && showCredit && pexelsCreditNames.length > 0
+              ? `${(t as any).videoAuthor || 'Video:'} Pexels / ${pexelsCreditNames.join(', ')}`
+              : null}
+            onBgVideosReady={(vs) => { bgVideosRef.current = vs; }}
           />
         </div>
       )}
@@ -1927,7 +2115,7 @@ export default function App() {
           </AnimatePresence>
           
           <div className="flex-[2] min-h-[250px] bg-[#0c0d11] border border-[#1a1c22] rounded-md overflow-hidden relative mb-2">
-            <AudioVisualizer mode={visMode} analyser={audioEngine.current?.getAnalysers().L || null} coverArt={coverArt || "./logo_Neural Master Pro.png"} />
+            <AudioVisualizer mode={visMode} analyser={audioEngine.current?.getAnalysers().L || null} coverArt={coverArt || "./logo_Neural Master Pro.png"} coverOffset={coverOffset} />
           </div>
 
           <div className={cn("flex gap-4 mb-2 shrink-0", appMode === 'pro' ? "items-stretch h-[200px]" : "items-start")}>
@@ -2156,26 +2344,44 @@ export default function App() {
         <aside className="bg-[var(--panel)] p-5 overflow-y-auto flex flex-col gap-6">
           <div>
             <div className="text-[11px] font-bold uppercase tracking-widest text-[var(--text-dim)] mb-3">{t.metadata}</div>
-            <div 
-              onClick={() => document.getElementById('cover-upload')?.click()}
+            <div
+              onClick={() => {
+                // A finished drag also ends in a click on the box — suppress
+                // it or the upload dialog would open right after panning.
+                if (coverDragMovedRef.current) { coverDragMovedRef.current = false; return; }
+                document.getElementById('cover-upload')?.click();
+              }}
               className="aspect-square bg-black border-2 border-dashed border-[var(--border)] flex flex-col items-center justify-center text-[11px] text-[var(--text-dim)] rounded-lg hover:border-[var(--accent)]/40 transition-colors cursor-pointer group overflow-hidden relative"
             >
               {coverArt ? (
-                <img src={coverArt} alt="Cover Art" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                <img
+                  src={coverArt}
+                  alt="Cover Art"
+                  className="w-full h-full object-cover"
+                  referrerPolicy="no-referrer"
+                  style={coverTransform ? { transform: coverTransform, cursor: 'grab', touchAction: 'none' } : undefined}
+                  onPointerDown={onCoverPointerDown}
+                  onPointerMove={onCoverPointerMove}
+                  onPointerUp={onCoverPointerUp}
+                  onPointerCancel={onCoverPointerUp}
+                />
               ) : (
                 <>
                   <ImageIcon size={32} className="mb-2 opacity-20 group-hover:opacity-50" />
                   {t.dropArt}
                 </>
               )}
-              <input 
+              <input
                 id="cover-upload"
-                type="file" 
-                accept="image/*" 
+                type="file"
+                accept="image/*"
                 onChange={handleCoverUpload}
                 className="hidden"
               />
             </div>
+            {coverDragPossible && (
+              <div className="text-[9px] text-[var(--text-dim)] mt-1">{(t as any).coverDragHint}</div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 gap-4">
@@ -2402,41 +2608,64 @@ export default function App() {
                         </div>
                         {pexelsError && <p className="text-[10px] text-red-400 font-mono">{pexelsError}</p>}
                         {pexelsResults.length > 0 && (
-                          <div className="grid grid-cols-3 gap-1.5 max-h-[220px] overflow-y-auto pr-1">
-                            {pexelsResults.map(clip => (
-                              <button
-                                key={clip.id}
-                                onClick={() => handleClipSelect(clip)}
-                                className={`relative rounded-sm overflow-hidden border ${selectedClip?.id === clip.id ? "border-[var(--accent)] shadow-[0_0_8px_rgba(255,0,128,0.4)]" : "border-[var(--border)]"}`}
-                              >
-                                <img src={clip.image} alt="" className="w-full aspect-[9/16] object-cover" loading="lazy" referrerPolicy="no-referrer" />
-                                <span className="absolute bottom-0 inset-x-0 bg-black/70 text-[8px] font-mono text-white px-1 py-0.5 flex items-center justify-between">
-                                  <span>{Math.round(clip.duration)}s</span>
-                                  <span className="truncate ml-1 max-w-[70%]">{clip.user.name}</span>
-                                </span>
-                              </button>
-                            ))}
+                          <div>
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-[9px] font-mono text-[var(--text-dim)]">
+                                {((t as any).selectUpTo || 'Select up to {n} clips — they cut on the audio peaks').replace('{n}', String(MAX_PEXELS_CLIPS))}
+                              </p>
+                              {pexelsSelection.length > 0 && (
+                                <button onClick={clearPexelsSelection} className="shrink-0 text-[9px] font-mono text-[var(--text-dim)] hover:text-white underline">
+                                  {(t as any).clearSelection || 'Clear'}
+                                </button>
+                              )}
+                            </div>
+                            <div className="grid grid-cols-3 gap-1.5 max-h-[220px] overflow-y-auto pr-1 mt-1">
+                              {pexelsResults.map(clip => {
+                                const selIdx = pexelsSelection.findIndex((s) => s.clip.id === clip.id);
+                                return (
+                                  <button
+                                    key={clip.id}
+                                    onClick={() => handleClipToggle(clip)}
+                                    className={`relative rounded-sm overflow-hidden border ${selIdx >= 0 ? "border-[var(--accent)] shadow-[0_0_8px_rgba(255,0,128,0.4)]" : "border-[var(--border)]"}`}
+                                  >
+                                    <img src={clip.image} alt="" className="w-full aspect-[9/16] object-cover" loading="lazy" referrerPolicy="no-referrer" />
+                                    {selIdx >= 0 && (
+                                      <span className="absolute top-0 left-0 bg-[var(--accent)] text-black text-[9px] font-bold px-1">{selIdx + 1}</span>
+                                    )}
+                                    <span className="absolute bottom-0 inset-x-0 bg-black/70 text-[8px] font-mono text-white px-1 py-0.5 flex items-center justify-between">
+                                      <span>{Math.round(clip.duration)}s</span>
+                                      <span className="truncate ml-1 max-w-[70%]">{clip.user.name}</span>
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
                           </div>
                         )}
-                        {selectedClip && (
+                        {pexelsSelection.length > 0 && (
                           <div className="space-y-1.5">
-                            {clipDl.s === 'downloading' && (
+                            <p className="text-[9px] font-mono text-[var(--text-dim)]">
+                              {((t as any).clipsSelected || '{n}/{max} selected').replace('{n}', String(pexelsSelection.length)).replace('{max}', String(MAX_PEXELS_CLIPS))}
+                              {' · '}
+                              {((t as any).clipsReady || '{done}/{total} clips ready').replace('{done}', String(pexelsReadyItems.length)).replace('{total}', String(pexelsSelection.length))}
+                            </p>
+                            {pexelsSelection.some((s) => s.status === 'downloading') && (
                               <div>
                                 <div className="h-1 bg-[#1a1c22] rounded-sm overflow-hidden">
-                                  <div className="h-full bg-[var(--accent)] transition-[width]" style={{ width: `${Math.round(clipDl.p * 100)}%` }} />
+                                  <div className="h-full bg-[var(--accent)] transition-[width]" style={{ width: `${Math.round(pexelsSelection.reduce((a, s) => a + s.progress, 0) / pexelsSelection.length * 100)}%` }} />
                                 </div>
-                                <p className="text-[10px] font-mono text-[var(--text-dim)] mt-1">{(t as any).downloading || "Downloading…"} {Math.round(clipDl.p * 100)}%</p>
+                                <p className="text-[10px] font-mono text-[var(--text-dim)] mt-1">{(t as any).downloading || "Downloading…"}</p>
                               </div>
                             )}
-                            {clipDl.s === 'error' && (
-                              <button onClick={() => { if (selectedClip) handleClipSelect(selectedClip); }} className="w-full bg-black border border-red-500/50 text-red-400 rounded-sm px-2 py-2 text-[11px]">
-                                {(t as any).retryDownload || "Retry download"}
+                            {pexelsSelection.filter((s) => s.status === 'error').map((s) => (
+                              <button key={s.clip.id} onClick={() => handleClipRetry(s.clip)} className="w-full bg-black border border-red-500/50 text-red-400 rounded-sm px-2 py-2 text-[11px]">
+                                #{pexelsSelection.findIndex((x) => x.clip.id === s.clip.id) + 1} {(t as any).retryDownload || "Retry download"}
                               </button>
-                            )}
-                            {clipDl.s === 'ready' && (
+                            ))}
+                            {pexelsReadyItems.length > 0 && (
                               <label className="flex items-start gap-1.5 text-[10px] font-mono cursor-pointer text-[var(--text-dim)]">
                                 <input type="checkbox" checked={showCredit} onChange={(e) => setShowCredit(e.target.checked)} className="accent-[var(--accent)] mt-px" />
-                                <span>{((t as any).videoCredit || 'Show "Video: Pexels / {author}" credit in clip').replace('{author}', selectedClip.user.name)}</span>
+                                <span>{((t as any).videoCredit || 'Show "Video: Pexels / {author}" credit in clip').replace('{author}', pexelsCreditNames.join(', '))}</span>
                               </label>
                             )}
                           </div>

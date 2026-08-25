@@ -10,6 +10,9 @@ import {
   type PipelineMetrics,
 } from './audioMeters.ts';
 import { applyChangedParams } from './paramDiff.ts';
+// Inline worker (base64 blob) — keeps the 4x true-peak / LUFS / tone pass off
+// the main thread so playback start is never blocked by the metrics pass.
+import MetricsWorker from './metricsWorker?worker&inline';
 
 /** MasteringSettings keys pushed to the live Faust chain (updateSettings). */
 const SETTING_PARAM_NAMES = [
@@ -48,6 +51,22 @@ export class AudioEngine {
   private isRefPlaying: boolean = false;
   private onEnded: () => void = () => {};
   private onErrorCb: ((msg: string) => void) | null = null;
+  private metricsWorker: Worker | null = null;
+  private metricsWorkerDead = false;
+  /** Which path the last measureTrack used. Mirrored to
+   *  window.__nmp_metrics_mode (unconditional, production-safe) so the packaged
+   *  smoke test can verify the inline worker runs under file:// — the DEV-only
+   *  __NMP__ hook is stripped from production builds. */
+  private metricsLastMode: 'worker' | 'main' | null = null;
+
+  public getMetricsMode(): 'worker' | 'main' | null {
+    return this.metricsLastMode;
+  }
+
+  private setMetricsMode(mode: 'worker' | 'main' | null): void {
+    this.metricsLastMode = mode;
+    (window as unknown as Record<string, unknown>).__nmp_metrics_mode = mode;
+  }
 
   /** UI hook for engine errors (replaces window.alert). */
   public setOnError(cb: (msg: string) => void) {
@@ -393,7 +412,7 @@ export class AudioEngine {
     const wasPlaying = this.isPlaying;
     if (wasPlaying) this.stop();
     this.offset = Math.max(0, Math.min(time, this.getDuration()));
-    if (wasPlaying) this.play();
+    if (wasPlaying) void this.play();
   }
 
   public async loadReferenceTrack(file: File) {
@@ -432,17 +451,17 @@ export class AudioEngine {
       }
     }
 
-    if (stateChanged && wasPlaying) this.play();
+    if (stateChanged && wasPlaying) void this.play();
   }
 
-  public play() {
+  public async play(): Promise<void> {
     if (this.context.state === 'suspended') {
-      this.context.resume();
+      try { await this.context.resume(); } catch { /* autoplay policy — start below still queues the source */ }
     }
     if (this.source) {
       try { this.source.stop(); } catch(e) {}
     }
-    
+
     const usingPreview = !this.isRefPlaying && this.previewActive && this.previewBuffer !== null;
     const activeBuffer = this.isRefPlaying
       ? this.refBuffer
@@ -472,7 +491,10 @@ export class AudioEngine {
       const safeOffset = Math.max(0, Math.min(this.offset, activeBuffer.duration));
       this.source.start(0, safeOffset);
     } catch(e) {
-      console.warn("Failed to start source", e);
+      // Never claim "playing" without a live source — getCurrentTime() would
+      // otherwise keep advancing from the audio clock with no sound.
+      this.source = null;
+      return;
     }
     this.isPlaying = true;
     this.startAutomation();
@@ -489,8 +511,10 @@ export class AudioEngine {
   }
 
   public stop() {
+    // Snapshot the position even when the source is already gone, so the
+    // timeline freezes at the exact pause point instead of a stale offset.
+    if (this.isPlaying) this.offset = this.getCurrentTime();
     if (this.source) {
-      this.offset = this.getCurrentTime();
       try { this.source.stop(); } catch(e) { /* ignore already stopped */ }
       try { this.source.disconnect(); } catch(e) {}
       this.source = null;
@@ -873,18 +897,106 @@ export class AudioEngine {
     };
   }
 
-  /**
-   * Full pre-mastering metrics for the loaded track (integrated LUFS, LRA,
-   * 4x true peak, crest, phase, DC, tonal profile). Runs async — fire it
-   * after load and let it finish in the background.
-   */
-  public async measureTrack(buffer: AudioBuffer | null): Promise<PipelineMetrics | null> {
-    if (!buffer || !this.isReady()) return null;
+  /** Lazily create the metrics worker; null when unavailable (fallback path). */
+  private getMetricsWorker(): Worker | null {
+    if (this.metricsWorkerDead) return null;
+    if (!this.metricsWorker) {
+      try {
+        this.metricsWorker = new MetricsWorker();
+      } catch {
+        this.metricsWorkerDead = true;
+        return null;
+      }
+      this.metricsWorker.onerror = () => {
+        this.metricsWorkerDead = true;
+        try { this.metricsWorker?.terminate(); } catch { /* ignore */ }
+        this.metricsWorker = null;
+      };
+    }
+    return this.metricsWorker;
+  }
+
+  /** Main-thread metrics pass (also the worker fallback — silent by design). */
+  private async measureMetricsMain(buffer: AudioBuffer): Promise<PipelineMetrics | null> {
     return measureMetrics(
       buffer.getChannelData(0),
       buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null,
       buffer.sampleRate
     );
+  }
+
+  /** Abort an in-flight worker pass (track swapped / unmount). */
+  public cancelMeasure(): void {
+    if (this.metricsWorker) {
+      try { this.metricsWorker.terminate(); } catch { /* ignore */ }
+      this.metricsWorker = null;
+    }
+  }
+
+  /**
+   * Full pre-mastering metrics for the loaded track (integrated LUFS, LRA,
+   * 4x true peak, crest, phase, DC, tonal profile). Runs in a web worker so
+   * the main thread (visualizer, meters) is never blocked; falls back to a
+   * main-thread pass when the worker is unavailable or for very long tracks.
+   */
+  public measureTrack(buffer: AudioBuffer | null): Promise<PipelineMetrics | null> {
+    if (!buffer || !this.isReady()) return Promise.resolve(null);
+    // Channel copies double memory (~500 MB for a 10 min stereo buffer) —
+    // keep those on the main-thread path which reads in place.
+    if (buffer.duration > 600) {
+      this.setMetricsMode('main');
+      return this.measureMetricsMain(buffer);
+    }
+    const w = this.getMetricsWorker();
+    if (!w) {
+      this.setMetricsMode('main');
+      return this.measureMetricsMain(buffer);
+    }
+
+    const left = new Float32Array(buffer.getChannelData(0));
+    const right = buffer.numberOfChannels > 1
+      ? new Float32Array(buffer.getChannelData(1)) : null;
+
+    return new Promise<PipelineMetrics | null>((resolve) => {
+      let settled = false;
+      const fallback = () => {
+        if (settled) return;
+        settled = true;
+        this.setMetricsMode('main');
+        this.measureMetricsMain(buffer).then(resolve).catch(() => resolve(null));
+      };
+      const onMsg = (e: MessageEvent) => {
+        const data = e.data as { ok?: boolean; metrics?: PipelineMetrics } | undefined;
+        if (!settled && data) {
+          settled = true;
+          w.removeEventListener('message', onMsg);
+          if (data.ok && data.metrics) {
+            this.setMetricsMode('worker');
+            resolve(data.metrics);
+          } else fallback();
+        }
+      };
+      w.addEventListener('message', onMsg);
+      try {
+        w.postMessage({ left, right, sampleRate: buffer.sampleRate },
+          [left.buffer, ...(right ? [right.buffer] : [])]);
+      } catch {
+        this.metricsWorkerDead = true;
+        try { w.terminate(); } catch { /* ignore */ }
+        this.metricsWorker = null;
+        fallback();
+        return;
+      }
+      // Safety net: a wedged worker must not keep trackMetricsBusy spinning.
+      setTimeout(() => {
+        if (!settled) {
+          try { w.terminate(); } catch { /* ignore */ }
+          this.metricsWorkerDead = true;
+          this.metricsWorker = null;
+          fallback();
+        }
+      }, 30 * 60 * 1000);
+    });
   }
 
   /**

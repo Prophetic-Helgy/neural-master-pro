@@ -178,3 +178,13 @@ export interface PexelsClip {
   user: { name: string; url: string };
   video_files: PexelsVideoFile[];
 }
+
+/** One selected Pexels clip, ready (or not yet) for the multi-clip background. */
+export interface PexelsSelectionItem {
+  clip: PexelsClip;
+  file: PexelsVideoFile;
+  /** Playable object URL once downloaded; null while downloading / on error. */
+  url: string | null;
+  status: 'downloading' | 'ready' | 'error';
+  progress: number;
+}
