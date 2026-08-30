@@ -2,10 +2,24 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
+// The strict CSP lives in index.html. In dev only, @vitejs/plugin-react
+// injects an inline react-refresh preamble that script-src 'self' would
+// block — relax just that directive while serving.
+const cspDev = {
+  name: 'csp-dev-relax',
+  apply: 'serve' as const,
+  transformIndexHtml: (html: string) =>
+    html.replace(
+      "script-src 'self' 'wasm-unsafe-eval' blob:;",
+      "script-src 'self' 'wasm-unsafe-eval' blob: 'unsafe-inline';"
+    ),
+};
+
 export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    cspDev,
   ],
   build: {
     minify: false, // Fixes "Qe is not defined" and AudioWorklet errors with Faust in prod

@@ -1,10 +1,36 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, session, protocol, net } = require('electron');
 const path = require('path');
+const { pathToFileURL } = require('url');
+const pkg = require('./package.json');
+
+// Packaged builds serve dist/ over the privileged standard scheme `app://bundle/`
+// instead of loadFile(). A file:// page lives in an OPAQUE origin, and Chromium
+// then refuses blob: workers (metrics / vocal-align inline workers) and several
+// same-origin fetches (wasm) from it. A registered standard scheme gives the
+// renderer a real origin (app://bundle) while webSecurity + sandbox stay ON.
+// Must be registered before app is ready.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
+]);
 
 // Set AppUserModelID for proper taskbar icon on Windows 7+
 if (process.platform === 'win32') {
   app.setAppUserModelId(app.getName() || 'com.neuralmasterpro.app');
 }
+
+// Single instance: a second launch focuses the first window instead of
+// spawning another renderer (and another TempServer process).
+const gotInstanceLock = app.requestSingleInstanceLock();
+if (!gotInstanceLock) {
+  app.quit();
+}
+app.on('second-instance', () => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win) {
+    if (win.isMinimized()) win.restore();
+    win.focus();
+  }
+});
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -12,20 +38,38 @@ function createWindow() {
     height: 900,
     minWidth: 1280,
     minHeight: 800,
-    title: 'Neural Master Pro 2.2',
+    // Version tracked from package.json — no stale hardcoded title.
+    title: `Neural Master Pro ${pkg.version}`,
     icon: path.join(__dirname, 'public', 'logo.ico'),
     frame: false,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      webSecurity: false
+      // Security baseline (v2.5 pentest): the renderer gets NO Node access —
+      // only the narrow contextBridge in preload.cjs. webSecurity stays on:
+      // the app is file:// + blob: + wasm, all same-origin compatible.
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      preload: path.join(__dirname, 'preload.cjs')
     }
   });
 
   win.setMenuBarVisibility(false);
+  // Keep the versioned window title; the page's <title> must not override it.
+  win.on('page-title-updated', (e) => e.preventDefault());
+
+  // Navigation guards: the app never navigates anywhere on its own. Packaged
+  // runs on file://, dev on the vite origin — anything else is denied.
+  win.webContents.on('will-navigate', (event, url) => {
+    const isDevServer = !app.isPackaged && url.startsWith('http://localhost:3000');
+    if (url.startsWith('app://') || url.startsWith('file://') || isDevServer) return;
+    event.preventDefault();
+  });
+  // No popups, ever (the UI opens no windows; window.open is attack surface).
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   if (app.isPackaged) {
-    win.loadFile(path.join(__dirname, 'dist', 'index.html'));
+    win.loadURL('app://bundle/index.html');
   } else {
     win.loadURL('http://localhost:3000');
   }
@@ -66,6 +110,27 @@ function startTempServer() {
 }
 
 app.whenReady().then(() => {
+  if (!gotInstanceLock) return; // second instance is quitting — do not open a window
+
+  // Serve dist/ over app://bundle/ (packaged). Path traversal is clamped to
+  // the dist root; unknown/escaped paths never reach the filesystem.
+  const distRoot = path.normalize(path.join(__dirname, 'dist'));
+  protocol.handle('app', (request) => {
+    const url = new URL(request.url);
+    let rel = decodeURIComponent(url.pathname || '/');
+    if (rel === '/') rel = '/index.html';
+    const filePath = path.normalize(path.join(distRoot, rel));
+    if (filePath !== distRoot && !filePath.startsWith(distRoot + path.sep)) {
+      return new Response('Forbidden', { status: 403 });
+    }
+    return net.fetch(pathToFileURL(filePath).toString());
+  });
+
+  // The app needs no OS permissions (no mic/camera/notifications/geolocation
+  // …). Deny every prompt so no content can request one.
+  session.defaultSession.setPermissionRequestHandler((wc, permission, callback) => callback(false));
+  session.defaultSession.setPermissionCheckHandler(() => false);
+
   startTempServer();
   createWindow();
 

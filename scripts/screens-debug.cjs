@@ -4,7 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const { execSync } = require('child_process');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// Edge 152.0.4191.53 headless is broken on this box (exits 0 with no render);
+// system Chrome works. Override with NMP_BROWSER.
+const EDGE = process.env.NMP_BROWSER || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const APP_URL = 'http://localhost:5210/';
 const OUT_DIR = path.join(__dirname, '..', 'docs', 'screenshots');
 const TONE = path.join(OUT_DIR, 'tone_test.wav');

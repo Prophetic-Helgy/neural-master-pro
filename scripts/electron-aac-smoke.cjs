@@ -1,24 +1,65 @@
 /**
  * electron-aac-smoke.cjs — spike check: does the @ffmpeg.wasm MODULE WORKER
- * run under file:// in Electron (packaged-equivalent load)?
+ * run under the packaged origin (app://bundle/, same privileged scheme as the
+ * v2.5 main.cjs) in Electron with the HARDENED webPreferences (sandboxed,
+ * isolated, webSecurity on, preload bridge only)?
  *
- * Loads dist/index.html exactly like the packaged app (loadFile,
- * nodeIntegration, webSecurity:false), then imports the built aacEncoder
- * chunk and encodes a 2 s tone to m4a. Exits 0 on success.
+ * The aacEncoder chunk name is discovered in the MAIN process (the sandboxed
+ * renderer has no fs/path) and passed into the page as a plain string; the
+ * page then dynamic-imports it relative to app://bundle/index.html and
+ * encodes a 2 s tone to m4a. Exits 0 on success.
  *
  * Run:  npx electron scripts/electron-aac-smoke.cjs   (after `npm run build`)
  */
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, net } = require('electron');
 const path = require('path');
+const { pathToFileURL } = require('url');
+const fs = require('fs');
 
 const TIMEOUT_MS = 90_000;
+const ASSETS = path.join(__dirname, '..', 'dist', 'assets');
+
+// Same privileged scheme as main.cjs (packaged origin class).
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
+]);
+
+ipcMain.handle('get-hardware-info', () => null);
+ipcMain.handle('get-hardware-temps', () => null);
 
 app.whenReady().then(async () => {
+  const chunk = fs.existsSync(ASSETS)
+    ? fs.readdirSync(ASSETS).find((f) => f.startsWith('aacEncoder-'))
+    : null;
+  if (!chunk) {
+    console.error('SMOKE FAIL: aacEncoder chunk not found in', ASSETS, '(run `npm run build` first)');
+    app.exit(3);
+  }
+
+  // Mirror main.cjs: serve dist/ over app://bundle/ (traversal-clamped).
+  const distRoot = path.normalize(path.join(__dirname, '..', 'dist'));
+  protocol.handle('app', (request) => {
+    const url = new URL(request.url);
+    let rel = decodeURIComponent(url.pathname || '/');
+    if (rel === '/') rel = '/index.html';
+    const filePath = path.normalize(path.join(distRoot, rel));
+    if (filePath !== distRoot && !filePath.startsWith(distRoot + path.sep)) {
+      return new Response('Forbidden', { status: 403 });
+    }
+    return net.fetch(pathToFileURL(filePath).toString());
+  });
+
   const win = new BrowserWindow({
     show: false,
     width: 1280,
     height: 800,
-    webPreferences: { nodeIntegration: true, contextIsolation: false, webSecurity: false },
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      preload: path.join(__dirname, '..', 'preload.cjs'),
+    },
   });
 
   const guard = setTimeout(() => {
@@ -27,7 +68,7 @@ app.whenReady().then(async () => {
   }, TIMEOUT_MS);
 
   try {
-    await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    await win.loadURL('app://bundle/index.html');
   } catch (e) {
     console.error('SMOKE LOAD FAIL:', e && e.message);
     app.exit(2);
@@ -43,14 +84,8 @@ app.whenReady().then(async () => {
 
   const res = await win.webContents.executeJavaScript(`(async () => {
     try {
-      const fs = require('fs');
-      const path = require('path');
-      const assetsDir = path.join(__dirname, 'assets');
-      const chunk = fs.readdirSync(assetsDir).find((f) => f.startsWith('aacEncoder-'));
-      if (!chunk) return { ok: false, err: 'aacEncoder chunk not found in ' + assetsDir };
-
       const t0 = Date.now();
-      const mod = await import('./assets/' + chunk);
+      const mod = await import('./assets/' + ${JSON.stringify(chunk)});
       const sr = 44100;
       const off = new OfflineAudioContext(2, sr * 2, sr);
       const osc = off.createOscillator(); osc.frequency.value = 440;
@@ -76,5 +111,5 @@ app.whenReady().then(async () => {
 
   clearTimeout(guard);
   console.log('SMOKE RESULT:', JSON.stringify(res, null, 2));
-  app.exit(res && res.ok ? 0 : 3);
+  app.exit(res && res.ok && res.ftyp === 'ftyp' ? 0 : 3);
 });

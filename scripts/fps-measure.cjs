@@ -14,7 +14,9 @@ const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// Edge 152.0.4191.53 headless is broken on this box (exits 0 with no render);
+// system Chrome works. Override with NMP_BROWSER.
+const EDGE = process.env.NMP_BROWSER || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const APP_URL = process.argv[2] || 'http://localhost:3000/';
 const TOTAL_SEC = Number(process.argv[3] || 30);
 const TONE = path.join(__dirname, '..', 'docs', 'screenshots', 'fps_tone.wav');

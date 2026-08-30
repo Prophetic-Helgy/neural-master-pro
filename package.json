@@ -1,10 +1,10 @@
 {
   "name": "neural-master-pro",
-  "productName": "Neural Master Pro 2.4",
+  "productName": "Neural Master Pro 2.5",
   "description": "Premium AI-powered audio mastering application with real-time Faust DSP engine.",
   "author": "Oleg",
   "private": true,
-  "version": "2.4.0",
+  "version": "2.5.0",
   "type": "module",
   "main": "main.cjs",
   "scripts": {
@@ -25,7 +25,8 @@
     },
     "files": [
       "dist/**/*",
-      "main.cjs"
+      "main.cjs",
+      "preload.cjs"
     ],
     "extraResources": [
       "NeuralMasterTempServer.exe"
@@ -34,7 +35,6 @@
   "dependencies": {
     "@ffmpeg/core": "0.12.10",
     "@ffmpeg/ffmpeg": "0.12.15",
-    "@google/genai": "^1.3.0",
     "@grame/faustwasm": "^0.16.1",
     "@mediabunny/flac-encoder": "^1.55.2",
     "@mediabunny/mp3-encoder": "^1.55.2",
@@ -45,7 +45,7 @@
     "motion": "^11.11.17",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "systeminformation": "^5.31.5",
+    "systeminformation": "^5.33.6",
     "tailwind-merge": "^2.5.4"
   },
   "devDependencies": {

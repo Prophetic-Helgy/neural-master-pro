@@ -3,12 +3,13 @@
  * Modelled on MoneyPrinterTurbo's material.py: search -> rendition pick ->
  * cached download with validation.
  *
- * NOTE: the API key is embedded as a fallback only; it can be overridden via
+ * NOTE: no API key ships with the app — users paste their own Pexels key into
+ * the video-backgrounds panel; it is stored locally in
  * localStorage['nmp_pexels_key']. The key itself is never logged.
  */
 import { PexelsClip, PexelsVideoFile } from '../types';
 
-const DEFAULT_PEXELS_KEY = '[REMOVED-PEXELS-KEY]';
+const DEFAULT_PEXELS_KEY = '';
 const API_BASE = 'https://api.pexels.com/v1';
 const KEY_STORAGE = 'nmp_pexels_key';
 // Max background clips per export. Each clip runs a full <video> decoder,
@@ -35,6 +36,20 @@ const getKey = (): string => {
     return localStorage.getItem(KEY_STORAGE) || DEFAULT_PEXELS_KEY;
   } catch {
     return DEFAULT_PEXELS_KEY;
+  }
+};
+
+/** Whether the user has provided a Pexels API key (none ships with the app). */
+export const hasPexelsKey = (): boolean => getKey().length > 0;
+
+/** Store the user's Pexels API key locally (localStorage only). */
+export const setPexelsKey = (key: string): void => {
+  try {
+    const v = key.trim();
+    if (v) localStorage.setItem(KEY_STORAGE, v);
+    else localStorage.removeItem(KEY_STORAGE);
+  } catch {
+    /* storage unavailable (private mode) — feature simply stays disabled */
   }
 };
 

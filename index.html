@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Hardened CSP. connect-src https: is deliberate: the user-configured
+         LLM endpoint and Pexels search (the two intentional online features);
+         img-src https: is for Pexels thumbnails. Dev server gets
+         script-src 'unsafe-inline' via the csp-dev plugin (react-refresh
+         preamble) — the shipped build stays strict. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; connect-src 'self' blob: data: https: http://localhost:* ws://localhost:*; img-src 'self' data: blob: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:;"
+    />
     <title>Neural Master Pro</title>
   </head>
   <body>
