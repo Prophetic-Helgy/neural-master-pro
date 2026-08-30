@@ -30,6 +30,7 @@ import { decodeWavSamples, encodeWav } from '../src/lib/wavEncode.ts';
 import { encodeAudio } from '../src/lib/exportEncoders.ts';
 import { buildAacArgs } from '../src/lib/aacEncoder.ts';
 import { applyChangedParams, PARAM_EPS } from '../src/lib/paramDiff.ts';
+import { alignVocal } from '../src/lib/audioAlign.ts';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -894,6 +895,94 @@ function t23(): void {
 }
 
 /**
+ * t27 — Vocal Align core (audioAlign.ts): onset-grid alignment of a delayed
+ * dub onto a guide, maxStretch guard, silence passthrough, determinism.
+ */
+function t27(): void {
+  console.log('\nT27. Vocal Align: guide/dub onset alignment + guards');
+  const sr = 44100;
+  const dur = 5;
+  const N = sr * dur;
+  let seed = 12345;
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
+  const bursts = (times: number[], amp = 0.7, floor = 0) => {
+    const x = new Float32Array(N);
+    if (floor > 0) for (let i = 0; i < N; i++) x[i] = rnd() * floor;
+    for (const t of times) {
+      const s0 = Math.round(t * sr);
+      const len = Math.round(0.02 * sr);
+      for (let k = 0; k < len && s0 + k < N; k++) x[s0 + k] += rnd() * amp * (1 - k / len);
+    }
+    return x;
+  };
+  const guideT = [1.0, 2.5, 4.0];
+  const dubT = [1.35, 2.90, 4.50];
+  const guide = bursts(guideT, 0.7, 0.01);
+  const dub = bursts(dubT, 0.7, 0.015);
+
+  // rising-edge onsets on a 10 ms envelope grid (quantization ≤ 10 ms)
+  const topOnsets = (x: Float32Array, minGapS = 0.3, max = 6) => {
+    const hop = Math.round(0.01 * sr);
+    const env: number[] = [];
+    for (let i = 0; i + hop <= x.length; i += hop) {
+      let s = 0;
+      for (let j = 0; j < hop; j++) s += x[i + j] * x[i + j];
+      env.push(Math.sqrt(s / hop));
+    }
+    const peak = Math.max(...env);
+    const thr = peak * 0.3;
+    const out: number[] = [];
+    let last = -Infinity;
+    for (let i = 1; i < env.length; i++) {
+      if (!(env[i] >= thr && env[i - 1] < thr)) continue;
+      const t = (i * hop) / sr;
+      if (t - last < minGapS) continue;
+      out.push(t); last = t;
+      if (out.length >= max) break;
+    }
+    return out;
+  };
+
+  const r1 = alignVocal(guide, dub, sr, 1, 3);
+  check('aligned length = guide length', r1.aligned.length === guide.length, `${r1.aligned.length} vs ${guide.length}`);
+  check('anchors matched (≥3)', r1.anchors >= 3, `anchors=${r1.anchors}`);
+  const alignedOn = topOnsets(r1.aligned);
+  let maxErr = 0;
+  for (const gT of guideT) {
+    let best = Infinity;
+    for (const a of alignedOn) best = Math.min(best, Math.abs(a - gT));
+    maxErr = Math.max(maxErr, best);
+  }
+  check('aligned onsets land on guide grid (±30 ms)', maxErr <= 0.03, `maxErr=${(maxErr * 1000).toFixed(1)} ms onsets=${alignedOn.map((x) => x.toFixed(2)).join(',')}`);
+
+  // maxStretch guard: dub burst at 4.0 s vs guide at 1.0 s (>3× needed)
+  const r2 = alignVocal(bursts([1.0], 0.7, 0.01), bursts([4.0], 0.7, 0.01), sr, 1, 2);
+  check('maxStretch guard: no crash, finite output',
+    r2.aligned.length === sr * dur && r2.aligned.every((v) => Number.isFinite(v)),
+    `len=${r2.aligned.length}`);
+
+  // silence guide → passthrough (documented behavior)
+  const silent = new Float32Array(N);
+  const r3 = alignVocal(silent, dub, sr, 1, 2);
+  check('silence guide → passthrough (dub copy, 0 anchors)',
+    r3.anchors === 0 && r3.aligned.every((v, i) => v === dub[Math.min(i, dub.length - 1)]),
+    `anchors=${r3.anchors}`);
+
+  // strength 0 → dub verbatim on guide grid, anchors still reported
+  const r4 = alignVocal(guide, dub, sr, 0, 2);
+  check('strength 0 → dub passthrough, anchors reported',
+    r4.anchors >= 3 && r4.aligned.every((v, i) => v === dub[Math.min(i, dub.length - 1)]),
+    `anchors=${r4.anchors}`);
+
+  // determinism ×3 (bitwise)
+  const a = alignVocal(guide, dub, sr, 1, 2).aligned;
+  const b = alignVocal(guide, dub, sr, 1, 2).aligned;
+  const c = alignVocal(guide, dub, sr, 1, 2).aligned;
+  check('deterministic ×3 (bitwise identical)',
+    a.every((v, i) => v === b[i] && v === c[i]), `len=${a.length}`);
+}
+
+/**
  * t25 — i18n translation-completeness gate. Delegates to
  * scripts/check-i18n-parity.cjs (the curation source of truth: key parity,
  * no empty values, no EN-identical values outside the curated TERMS list)
@@ -1053,6 +1142,7 @@ async function main(): Promise<void> {
   t22();
   t23();
   t24();
+  t27();
   t25();
 
   console.log(`\n${'='.repeat(60)}`);

@@ -24,6 +24,8 @@ const SETTING_PARAM_NAMES = [
   'bass_autotune', 'bass_reverb', 'bass_distortion', 'bass_delay', 'bass_chorus',
   'mid_autotune', 'mid_reverb', 'mid_distortion', 'mid_delay', 'mid_chorus',
   'side_autotune', 'side_reverb', 'side_distortion', 'side_delay', 'side_chorus',
+  'vocal_autotune', 'vocal_reverb', 'vocal_distortion', 'vocal_delay', 'vocal_chorus',
+  'stem_solo',
   'peq1Freq', 'peq1Q', 'peq1Gain', 'peq1Type',
   'peq2Freq', 'peq2Q', 'peq2Gain', 'peq2Type',
   'peq3Freq', 'peq3Q', 'peq3Gain', 'peq3Type',
@@ -53,6 +55,10 @@ export class AudioEngine {
   private onErrorCb: ((msg: string) => void) | null = null;
   private metricsWorker: Worker | null = null;
   private metricsWorkerDead = false;
+  /** Settle hook for the in-flight measureTrack pass: a worker that dies
+   *  after postMessage must NOT leave the promise pending for the full
+   *  safety-net timeout (UI would spin "analyzing" for 30 min). */
+  private pendingMeasureFallback: (() => void) | null = null;
   /** Which path the last measureTrack used. Mirrored to
    *  window.__nmp_metrics_mode (unconditional, production-safe) so the packaged
    *  smoke test can verify the inline worker runs under file:// — the DEV-only
@@ -289,7 +295,7 @@ export class AudioEngine {
       const t = this.getCurrentTime();
 
       const activeRegions = this.activeRegions.filter(r => t >= r.start && t <= r.end);
-      const stems: ('master' | 'bass' | 'mid' | 'side')[] = ['master', 'bass', 'mid', 'side'];
+      const stems: ('master' | 'bass' | 'vocal' | 'mid' | 'side')[] = ['master', 'bass', 'vocal', 'mid', 'side'];
 
       stems.forEach(stem => {
         const region = activeRegions.find(r => r.targetStem === stem);
@@ -588,7 +594,7 @@ export class AudioEngine {
 
     const applyParams = (t: number) => {
       const activeRegions = regions.filter(r => t >= r.start && t < r.end);
-      const stems: ('master' | 'bass' | 'mid' | 'side')[] = ['master', 'bass', 'mid', 'side'];
+      const stems: ('master' | 'bass' | 'vocal' | 'mid' | 'side')[] = ['master', 'bass', 'vocal', 'mid', 'side'];
 
       stems.forEach(stem => {
         const region = activeRegions.find(r => r.targetStem === stem);
@@ -671,6 +677,7 @@ export class AudioEngine {
     setParam("tremoloAmt", settings.tremoloAmt);
     setParam("bitDepth", settings.bitDepth);
     setParam("srHold", settings.srHold);
+    setParam("stem_solo", settings.stem_solo ?? 0);
     applyParams(startSec);
 
     // Schedule suspensions for automation
@@ -911,6 +918,10 @@ export class AudioEngine {
         this.metricsWorkerDead = true;
         try { this.metricsWorker?.terminate(); } catch { /* ignore */ }
         this.metricsWorker = null;
+        // Wake up a measure awaiting this worker's answer (it never comes).
+        const fb = this.pendingMeasureFallback;
+        this.pendingMeasureFallback = null;
+        if (fb) fb();
       };
     }
     return this.metricsWorker;
@@ -931,6 +942,7 @@ export class AudioEngine {
       try { this.metricsWorker.terminate(); } catch { /* ignore */ }
       this.metricsWorker = null;
     }
+    this.pendingMeasureFallback = null;
   }
 
   /**
@@ -969,6 +981,7 @@ export class AudioEngine {
         const data = e.data as { ok?: boolean; metrics?: PipelineMetrics } | undefined;
         if (!settled && data) {
           settled = true;
+          if (this.pendingMeasureFallback === fallback) this.pendingMeasureFallback = null;
           w.removeEventListener('message', onMsg);
           if (data.ok && data.metrics) {
             this.setMetricsMode('worker');
@@ -977,6 +990,7 @@ export class AudioEngine {
         }
       };
       w.addEventListener('message', onMsg);
+      this.pendingMeasureFallback = fallback;
       try {
         w.postMessage({ left, right, sampleRate: buffer.sampleRate },
           [left.buffer, ...(right ? [right.buffer] : [])]);

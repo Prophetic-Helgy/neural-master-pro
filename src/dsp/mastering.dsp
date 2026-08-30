@@ -53,6 +53,15 @@ side_distortionAmt = ui(hslider("side_distortion", 0, 0, 100, 0.1));
 side_delayAmt = ui(hslider("side_delay", 0, 0, 100, 0.1));
 side_chorusAmt = ui(hslider("side_chorus", 0, 0, 100, 0.1));
 
+vocal_autotuneAmt = ui(hslider("vocal_autotune", 0, 0, 100, 0.1));
+vocal_reverbAmt = ui(hslider("vocal_reverb", 0, 0, 100, 0.1));
+vocal_distortionAmt = ui(hslider("vocal_distortion", 0, 0, 100, 0.1));
+vocal_delayAmt = ui(hslider("vocal_delay", 0, 0, 100, 0.1));
+vocal_chorusAmt = ui(hslider("vocal_chorus", 0, 0, 100, 0.1));
+
+// Stem solo: 0 = master (all stems), 1 = bass, 2 = vocal, 3 = mid, 4 = side
+stem_solo = ui(hslider("stem_solo", 0, 0, 4, 1));
+
 // Parametric EQ parameters (4 bands)
 // type: 0 = peak, 1 = low shelf, 2 = high shelf
 // freq slider 0..100 maps logarithmically to 20 Hz .. 20 kHz
@@ -319,27 +328,45 @@ fx_chain_mono(d_a, a_a, del_a, c_a, x) = x : fx_dist_mono(d_a) : fx_auto_mono(a_
 fx_reverb_stereo(r_amt) = _,_ <: ( (re.zita_rev1_stereo(20,200,6000,1.2,1.5,48000) : *(rV), *(rV)) , (_,_) ) :> _,_
 with { rV = r_amt / 100.0 * 0.5; };
 
-stem_crossover(l_in, r_in) = (bass_stereo, mid_stereo, side_stereo) :> _,_
+stem_crossover(l_in, r_in) = ((bass_stereo : solo_gate(1)), (vocal_stereo : solo_gate(2)), (mid_stereo : solo_gate(3)), (side_stereo : solo_gate(4))) :> _,_
 with {
     m_raw = (l_in + r_in) * 0.5;
     s_raw = (l_in - r_in) * 0.5;
 
-    // Perfect reconstruction crossover using subtraction
+    // Perfect reconstruction crossover using subtraction.
+    // Vocal band (200 Hz–8 kHz) is carved out of the center as its own stem;
+    // bass + vocal + mid_body still sum back to m_raw.
     bass_clean = m_raw : fi.lowpass(2, 120);
     mid_clean = m_raw - bass_clean;
+    vocal_clean = mid_clean : fi.highpass(2, 200) : fi.lowpass(2, 8000);
+    mid_body = mid_clean - vocal_clean;
     side_clean = s_raw;
 
     // Stem Mono Chains
     bass_fx = bass_clean : fx_chain_mono(bass_distortionAmt, bass_autotuneAmt, bass_delayAmt, bass_chorusAmt);
-    mid_fx = mid_clean : fx_chain_mono(mid_distortionAmt, mid_autotuneAmt, mid_delayAmt, mid_chorusAmt);
+    vocal_fx = vocal_clean : fx_chain_mono(vocal_distortionAmt, vocal_autotuneAmt, vocal_delayAmt, vocal_chorusAmt);
+    mid_fx = mid_body : fx_chain_mono(mid_distortionAmt, mid_autotuneAmt, mid_delayAmt, mid_chorusAmt);
     side_fx = side_clean : fx_chain_mono(side_distortionAmt, side_autotuneAmt, side_delayAmt, side_chorusAmt);
 
     // Stem Stereo Paths (Core + Reverb)
     // fx_reverb_stereo internally passes the dry signal alongside the wet,
     // so we don't need to reconstruct the core manually.
     bass_stereo = (bass_fx, bass_fx) : fx_reverb_stereo(bass_reverbAmt);
+    vocal_stereo = (vocal_fx, vocal_fx) : fx_reverb_stereo(vocal_reverbAmt);
     mid_stereo  = (mid_fx, mid_fx)   : fx_reverb_stereo(mid_reverbAmt);
     side_stereo = (side_fx, side_fx * -1.0) : fx_reverb_stereo(side_reverbAmt);
+
+    // Solo gate: stem n passes when stem_solo is 0 (master) or n.
+    // One-pole smoothing (crush_node `loop ~ _` idiom — fi.smooth is not
+    // exposed in faustwasm 0.16.1 signals.lib) avoids clicks on solo toggles.
+    solo_gate(n) = par(i, 2, *(gate)) with {
+        want = (stem_solo == 0) + (stem_solo == n);
+        kk = 0.01;
+        gate = loop ~ _
+        with {
+            loop(yState) = kk * want + (1.0 - kk) * yState;
+        };
+    };
 };
 
 fx_master = (process_chan, process_chan) : fx_reverb_stereo(reverbAmt)

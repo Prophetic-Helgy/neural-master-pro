@@ -40,7 +40,9 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// Edge 152.0.4191.53 headless is broken on this box (exits 0 with no render);
+// system Chrome works. Override with NMP_BROWSER.
+const EDGE = process.env.NMP_BROWSER || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const APP_URL = process.argv[2] || 'http://127.0.0.1:3000/';
 const OUT_DIR = path.join(__dirname, '..', 'docs', 'screenshots');
 
@@ -100,6 +102,32 @@ function writeToneWav(file, freqs, dur, sr = 44100) {
     const r = Math.max(-1, Math.min(1, s * env * 0.9));
     pcm.writeInt16LE(Math.round(l * 32767), i * 4);
     pcm.writeInt16LE(Math.round(r * 32767), i * 4 + 2);
+  }
+  const hdr = Buffer.alloc(44);
+  hdr.write('RIFF', 0); hdr.writeUInt32LE(36 + pcm.length, 4); hdr.write('WAVE', 8);
+  hdr.write('fmt ', 12); hdr.writeUInt32LE(16, 16); hdr.writeUInt16LE(1, 20); hdr.writeUInt16LE(2, 22);
+  hdr.writeUInt32LE(sr, 24); hdr.writeUInt32LE(sr * 4, 28); hdr.writeUInt16LE(4, 32); hdr.writeUInt16LE(16, 34);
+  hdr.write('data', 36); hdr.writeUInt32LE(pcm.length, 40);
+  fs.writeFileSync(file, Buffer.concat([hdr, pcm]));
+}
+
+// Onset-grid fixture for Vocal Align (M1.13): noise floor + 20 ms bursts.
+function writeBurstsWav(file, times, dur, sr = 44100) {
+  let seed = 987654321;
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
+  const n = Math.round(sr * dur);
+  const buf = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) buf[i] = rnd() * 0.02;
+  for (const t of times) {
+    const s0 = Math.round(t * sr);
+    const len = Math.round(0.02 * sr);
+    for (let k = 0; k < len && s0 + k < n; k += 1) buf[s0 + k] += rnd() * 0.7 * (1 - k / len);
+  }
+  const pcm = Buffer.alloc(n * 4);
+  for (let i = 0; i < n; i += 1) {
+    const v = Math.max(-1, Math.min(1, buf[i]));
+    pcm.writeInt16LE(Math.round(v * 32767), i * 4);
+    pcm.writeInt16LE(Math.round(v * 32767), i * 4 + 2);
   }
   const hdr = Buffer.alloc(44);
   hdr.write('RIFF', 0); hdr.writeUInt32LE(36 + pcm.length, 4); hdr.write('WAVE', 8);
@@ -461,6 +489,11 @@ async function awaitDownload(page, ms = 120000) {
   writeToneWav(B1, [100], 3);
   writeToneWav(B2, [200], 3);
   writeToneWav(B3, [300], 3);
+  // Vocal Align fixtures: dub = guide onsets delayed ~0.35 s, longer by 0.35 s.
+  const GUIDE = path.join(OUT_DIR, 'e2e_guide.wav');
+  const DUB = path.join(OUT_DIR, 'e2e_dub.wav');
+  writeBurstsWav(GUIDE, [1.0, 2.5, 4.0], 5);
+  writeBurstsWav(DUB, [1.35, 2.9, 4.5], 5.35);
 
   const browser = await puppeteer.launch({
     executablePath: EDGE,
@@ -705,6 +738,8 @@ async function awaitDownload(page, ms = 120000) {
         ['bass_autotune', 70], ['bass_reverb', 80], ['bass_distortion', 60], ['bass_delay', 50], ['bass_chorus', 45],
         ['mid_autotune', 70], ['mid_reverb', 80], ['mid_distortion', 60], ['mid_delay', 50], ['mid_chorus', 45],
         ['side_autotune', 70], ['side_reverb', 80], ['side_distortion', 60], ['side_delay', 50], ['side_chorus', 45],
+        ['vocal_autotune', 70], ['vocal_reverb', 80], ['vocal_distortion', 60], ['vocal_delay', 50], ['vocal_chorus', 45],
+        ['stem_solo', 2],
         ['eq31', 4], ['eq62', -3], ['eq125', 4], ['eq250', -2], ['eq500', 3],
         ['eq1k', -4], ['eq2k', 2], ['eq4k', -3], ['eq8k', 4], ['eq16k', -2],
         ['widenerAmt', 80], ['mono', 1], ['compAmt', 60], ['transAmt', 50],
@@ -1192,6 +1227,114 @@ async function awaitDownload(page, ms = 120000) {
     const after = await readShiftPct();
     check('cover: offset reset to center', resetOk === true && Math.abs(after) < 0.001,
       `resetOk=${resetOk} after=${after}`);
+  }
+
+  // =========================================================================
+  section('M1.12 — Stem Studio: vocal tab, solo preview, stems ZIP export');
+  // =========================================================================
+  {
+    // Stem selector row: 5 stem tabs + SOLO + export button.
+    const tabs = await page.evaluate(() => {
+      const row = document.querySelector('[data-testid="stem-solo"]');
+      return row && row.parentElement
+        ? [...row.parentElement.querySelectorAll('button')].map((b) => b.textContent.trim())
+        : [];
+    });
+    check('stem row: 5 tabs + SOLO + export', tabs.length === 7, tabs.join(','));
+
+    // VOCAL tab selects the stem; the FX grid then binds vocal_* params.
+    const vocalClicked = await h(page, 'clickText', 'VOCAL');
+    await sleep(250);
+    const fx = await h(page, 'setFxSlider', 'Autotune', 70);
+    await sleep(250);
+    const vAuto = await h(page, 'dspParam', 'vocal_autotune');
+    check('vocal tab: FX slider writes vocal_autotune to DSP',
+      vocalClicked && fx && fx.ok && vAuto && !vAuto.err && Math.abs(vAuto.value - 70) < 0.5,
+      `fx=${JSON.stringify(fx)} param=${JSON.stringify(vAuto)}`);
+    // Leave the slider neutral for the rest of the suite.
+    await h(page, 'setFxSlider', 'Autotune', 0);
+    await sleep(150);
+
+    // SOLO toggles stem_solo 2 (vocal) and back to 0 (master).
+    const clickSolo = () => page.evaluate(() => {
+      const b = document.querySelector('[data-testid="stem-solo"]');
+      if (!b || b.disabled) return false;
+      b.click();
+      return true;
+    });
+    const soloClicked = await clickSolo();
+    await sleep(250);
+    const soloOn = await h(page, 'dspParam', 'stem_solo');
+    await clickSolo();
+    await sleep(250);
+    const soloOff = await h(page, 'dspParam', 'stem_solo');
+    check('SOLO: stem_solo 2 while on, 0 after toggle off',
+      soloClicked && soloOn && !soloOn.err && soloOn.value === 2 && soloOff && !soloOff.err && soloOff.value === 0,
+      `clicked=${soloClicked} on=${JSON.stringify(soloOn)} off=${JSON.stringify(soloOff)}`);
+
+    // Export Stems: 4 offline solo renders -> ZIP of 4 WAVs, ~track length.
+    const trackDur = await page.evaluate(() => window.__NMP__.getEngine().getDuration());
+    const clicked = await page.evaluate(() => {
+      const b = document.querySelector('[data-testid="export-stems"]');
+      if (!b || b.disabled) return false;
+      b.click();
+      return true;
+    });
+    const dl = await awaitDownload(page, 240000);
+    let stemsOk = false;
+    let detail = 'no download';
+    if (dl) {
+      try {
+        const files = unzip(dl.buf);
+        const names = Object.keys(files).sort();
+        const parsed = names.map((n) => ({ n, w: parseWav(files[n]) }));
+        stemsOk = names.length === 4
+          && ['bass', 'mid', 'side', 'vocal'].every((s) => names.some((n) => n.includes('_' + s)))
+          && parsed.every((x) => x.w && Math.abs(x.w.duration - trackDur) < 0.5 && [16, 24, 32].includes(x.w.bits));
+        detail = parsed.map((x) => `${x.n}: ${x.w ? `${x.w.duration.toFixed(2)}s ${x.w.bits}b pk=${x.w.peak.toFixed(3)}` : 'BAD'}`).join(' | ');
+      } catch (e) {
+        detail = 'unzip failed: ' + e.message;
+      }
+    }
+    check('Export Stems: ZIP with 4 valid stem WAVs', clicked && !!dl && stemsOk, detail);
+
+    // Return the stem tab to MASTER so later sections see the default view.
+    await h(page, 'clickText', 'MASTER');
+    await sleep(150);
+  }
+
+  // =========================================================================
+  section('M1.13 — Vocal Align: guide/dub upload → align → aligned WAV download');
+  // =========================================================================
+  {
+    const gIn = await page.$('input[data-testid="align-guide-input"]');
+    const dIn = await page.$('input[data-testid="align-dub-input"]');
+    check('vocal-align block: guide + dub inputs present', !!gIn && !!dIn, `g=${!!gIn} d=${!!dIn}`);
+    await gIn.uploadFile(GUIDE);
+    await sleep(900);
+    await dIn.uploadFile(DUB);
+    await sleep(900);
+    const applyEnabled = await page.$eval('[data-testid="align-apply"]', (b) => !b.disabled);
+    check('APPLY enabled once guide + dub are loaded', applyEnabled);
+    await page.evaluate(() => document.querySelector('[data-testid="align-apply"]').click());
+    let gotOut = false;
+    try {
+      await page.waitForFunction(() => !!document.querySelector('[data-testid="align-dl-aligned"]'), { timeout: 60000 });
+      gotOut = true;
+    } catch { /* stays false */ }
+    check('aligned result appears (worker or main-thread fallback)', gotOut);
+    const dl = await page.evaluate(() => {
+      const b = document.querySelector('[data-testid="align-dl-aligned"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    });
+    const aDl = dl ? await awaitDownload(page, 60000) : null;
+    const w = aDl ? parseWav(aDl.buf) : null;
+    // Guide grid (5.00 s), not the dub's (5.35 s) — proves the output is re-timed onto the guide.
+    check('aligned.wav valid and on the guide length (5.0 s ±0.1)',
+      !!w && Math.abs(w.duration - 5.0) < 0.1 && w.peak > 0.05,
+      w ? `${w.duration.toFixed(2)}s ${w.bits}b pk=${w.peak.toFixed(3)}` : 'no download');
   }
 
   // =========================================================================

@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './lib/AudioEngine';
 import { encodeAudio } from './lib/exportEncoders';
+import { zipSync } from 'fflate';
 import { i18n } from './lib/i18n';
 import { Language, MasteringSettings, TrackMetadata, ExportFormat, ExportQuality, AudioSnapshot, EffectRegion, TargetStem, PexelsClip, PexelsVideoFile, PexelsSelectionItem } from './types';
 import type { PipelineMetrics } from './lib/audioMeters';
@@ -34,7 +35,7 @@ import { MeteringBridge } from './components/MeteringBridge';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
 import { LiteMaster } from './components/LiteMaster';
 import { getAutoMasterSettings } from './services/geminiService';
-import { searchPexelsVideos, pickBestRendition, ensureClipBlob, PexelsApiError, MAX_PEXELS_CLIPS } from './services/pexelsService';
+import { searchPexelsVideos, pickBestRendition, ensureClipBlob, PexelsApiError, MAX_PEXELS_CLIPS, hasPexelsKey, setPexelsKey } from './services/pexelsService';
 import { findPeakCuePoints } from './lib/audioMeters';
 import { loadLlmConfig, saveLlmConfig, llmAutoMaster, llmAiReport, LlmConfig, LlmError } from './services/llmService';
 import { LlmSettingsModal } from './components/LlmSettingsModal';
@@ -43,6 +44,7 @@ import { twMerge } from 'tailwind-merge';
 
 import { GraphicEQ } from './components/GraphicEQ';
 import { ParametricEQ } from './components/ParametricEQ';
+import VocalAlignPanel from './components/VocalAlignPanel';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -80,6 +82,8 @@ const USER_PRESET_1: MasteringSettings = {
   bass_autotune: 0, bass_reverb: 0, bass_distortion: 0, bass_delay: 0, bass_chorus: 0,
   mid_autotune: 0, mid_reverb: 0, mid_distortion: 0, mid_delay: 0, mid_chorus: 0,
   side_autotune: 0, side_reverb: 0, side_distortion: 0, side_delay: 0, side_chorus: 0,
+  vocal_autotune: 0, vocal_reverb: 0, vocal_distortion: 0, vocal_delay: 0, vocal_chorus: 0,
+  stem_solo: 0,
   peq1Freq: 15, peq1Q: 1, peq1Gain: 0, peq1Type: 0,
   peq2Freq: 40, peq2Q: 1, peq2Gain: 0, peq2Type: 0,
   peq3Freq: 65, peq3Q: 1, peq3Gain: 0, peq3Type: 0,
@@ -127,6 +131,8 @@ const NEUTRAL_SETTINGS: MasteringSettings = {
   bass_autotune: 0, bass_reverb: 0, bass_distortion: 0, bass_delay: 0, bass_chorus: 0,
   mid_autotune: 0, mid_reverb: 0, mid_distortion: 0, mid_delay: 0, mid_chorus: 0,
   side_autotune: 0, side_reverb: 0, side_distortion: 0, side_delay: 0, side_chorus: 0,
+  vocal_autotune: 0, vocal_reverb: 0, vocal_distortion: 0, vocal_delay: 0, vocal_chorus: 0,
+  stem_solo: 0,
   peq1Freq: 15, peq1Q: 1, peq1Gain: 0, peq1Type: 0,
   peq2Freq: 40, peq2Q: 1, peq2Gain: 0, peq2Type: 0,
   peq3Freq: 65, peq3Q: 1, peq3Gain: 0, peq3Type: 0,
@@ -454,10 +460,9 @@ export default function App() {
 
   useEffect(() => {
     // Get hardware names once
-    if (typeof window !== 'undefined' && (window as any).require) {
+    if (typeof window !== 'undefined' && (window as any).nmpIpc) {
       try {
-        const { ipcRenderer } = (window as any).require('electron');
-        ipcRenderer.invoke('get-hardware-info').then((info: any) => {
+        (window as any).nmpIpc.getHardwareInfo().then((info: any) => {
           if (info.cpuName) {
             let name = info.cpuName
               .replace(/Processor/ig, '')
@@ -490,13 +495,10 @@ export default function App() {
 
   useEffect(() => {
     const getTemps = async () => {
-      // @ts-ignore
-      if (typeof window !== 'undefined' && window.require) {
+      if (typeof window !== 'undefined' && (window as any).nmpIpc) {
         try {
-          // @ts-ignore
-          const { ipcRenderer } = window.require('electron');
-          if (ipcRenderer) {
-            const stats = await ipcRenderer.invoke('get-hardware-temps');
+          const stats = await (window as any).nmpIpc.getHardwareTemps();
+          if (stats) {
             setCpuTemp(stats.cpuTemp !== undefined ? stats.cpuTemp : (stats.cpu || null));
             setGpuTemp(stats.gpuTemp !== undefined ? stats.gpuTemp : (stats.gpu || null));
             setCpuLoad(stats.cpuLoad || null);
@@ -571,6 +573,11 @@ export default function App() {
   const [pexelsSearching, setPexelsSearching] = useState(false);
   const [pexelsSelection, setPexelsSelection] = useState<PexelsSelectionItem[]>([]);
   const [pexelsError, setPexelsError] = useState<string | null>(null);
+  // No API key ships with the app; the user pastes their own (localStorage only).
+  const [pexelsKeyInput, setPexelsKeyInput] = useState(() => {
+    try { return localStorage.getItem('nmp_pexels_key') || ''; } catch { return ''; }
+  });
+  const [pexelsHasKey, setPexelsHasKey] = useState(() => hasPexelsKey());
   const [showCredit, setShowCredit] = useState(true);
   // Refs: handleExport is an async closure over one render, so it reads the
   // selection through refs (same reason as exportCanvasRef above).
@@ -701,6 +708,14 @@ export default function App() {
       // The heavy true-peak/LUFS/tone pass (4× 256-tap FIR over the whole
       // buffer) runs in a web worker — it no longer touches the main thread,
       // so it can start immediately without stuttering playback start.
+      // Engine boot races a fast upload: measureTrack early-returns while
+      // Faust is still compiling, so wait (bounded) for readiness first.
+      {
+        const readyDeadline = Date.now() + 90_000;
+        while (!audioEngine.current.isReady() && Date.now() < readyDeadline) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
       audioEngine.current.cancelMeasure(); // drop any pass for a previous track
       const measureGen = ++measureGenRef.current;
       audioEngine.current.measureTrack(audioEngine.current.getBuffer())
@@ -997,6 +1012,10 @@ export default function App() {
   const runPexelsSearch = async () => {
     const q = pexelsQuery.trim();
     if (!q || pexelsSearching) return;
+    if (!hasPexelsKey()) {
+      setPexelsError(((t as any).pexelsNoKey || 'Add your Pexels API key to search — get one free at pexels.com/api'));
+      return;
+    }
     setPexelsSearching(true);
     setPexelsError(null);
     try {
@@ -1085,6 +1104,41 @@ export default function App() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
+  // Stem export: four offline renders of the live chain, one per stem solo
+  // (bass/vocal/mid/side). The exported stem is exactly what SOLO previews —
+  // same crossover, same per-stem FX, same master-chain stages. Stems are
+  // complementary bands (bass+vocal+mid sum to center, side is L−R); they are
+  // not ML-isolated sources.
+  const [stemsExportBusy, setStemsExportBusy] = useState(false);
+  const handleExportStems = async () => {
+    if (!track || !audioEngine.current || stemsExportBusy) return;
+    setStemsExportBusy(true);
+    try {
+      const base = metadata.title || 'master';
+      const entries: Record<string, Uint8Array> = {};
+      for (const [stemName, soloIdx] of [['bass', 1], ['vocal', 2], ['mid', 3], ['side', 4]] as const) {
+        const stemSettings = { ...settings, stem_solo: soloIdx };
+        const pcm = await audioEngine.current.renderProPcm(
+          stemSettings, Number(trimStart) || 0, Number(trimEnd) || 0, effectRegions
+        );
+        if (!pcm) throw new Error('Pro render failed — engine not ready');
+        const enc = await encodeAudio(pcm.left, pcm.right, pcm.sampleRate, {
+          format: 'wav',
+          bitDepth: proWavBit,
+          metadata,
+        });
+        entries[`${base}_${stemName}.wav`] = new Uint8Array(await enc.blob.arrayBuffer());
+      }
+      const zipped = zipSync(entries);
+      downloadBlob(new Blob([zipped], { type: 'application/zip' }), `${base}_stems.zip`);
+      showToast(`${(t as any).stemsExported || 'Stems exported'}: bass, vocal, mid, side`, 'warn');
+    } catch (e) {
+      showToast(`Stems export failed: ${(e as Error).message}`, 'error');
+    } finally {
+      setStemsExportBusy(false);
+    }
   };
 
   const handleExport = async () => {
@@ -1425,9 +1479,8 @@ export default function App() {
         <div className="flex items-center justify-end w-1/3 gap-3" style={{ WebkitAppRegion: 'no-drag' } as any}>
           <button 
              onClick={() => {
-               if (typeof window !== 'undefined' && (window as any).require) {
-                 const { ipcRenderer } = (window as any).require('electron');
-                 ipcRenderer.send('minimize-app');
+               if (typeof window !== 'undefined' && (window as any).nmpIpc) {
+                 (window as any).nmpIpc.minimize();
                }
              }}
              className="text-[var(--text-dim)] hover:text-white p-2 transition-colors"
@@ -1450,9 +1503,8 @@ export default function App() {
           
           <button 
              onClick={() => {
-               if (typeof window !== 'undefined' && (window as any).require) {
-                 const { ipcRenderer } = (window as any).require('electron');
-                 ipcRenderer.send('close-app');
+               if (typeof window !== 'undefined' && (window as any).nmpIpc) {
+                 (window as any).nmpIpc.close();
                } else {
                  window.close();
                }
@@ -2183,22 +2235,52 @@ export default function App() {
           </div>
 
           {appMode === 'pro' && (<>
-          {/* Stem Selector for FX */}
+          {/* Stem Selector for FX + solo preview + stems export */}
           <div className="mb-2 flex items-center justify-center gap-1 border border-[#222] bg-[#0c0d11] p-1 rounded-sm">
             {[
               { id: 'master', label: (t as any).stemMaster || 'MASTER' },
-              { id: 'bass', label: (t as any).stemBass || 'BASS (LOWS)' },
-              { id: 'mid', label: (t as any).stemMid || 'MID (VOCALS/CENTER)' },
-              { id: 'side', label: (t as any).stemSide || 'SIDE (INSTRUMENTS/WIDTH)' },
+              { id: 'bass', label: (t as any).stemBass || 'BASS' },
+              { id: 'vocal', label: (t as any).stemVocal || 'VOCAL' },
+              { id: 'mid', label: (t as any).stemMid || 'MID' },
+              { id: 'side', label: (t as any).stemSide || 'SIDE' },
             ].map(stem => (
               <button
                 key={stem.id}
-                onClick={() => setActiveStem(stem.id as TargetStem)}
+                onClick={() => {
+                  setActiveStem(stem.id as TargetStem);
+                  // Solo follows the selected stem (master tab exits solo).
+                  const soloIdx = ({ bass: 1, vocal: 2, mid: 3, side: 4 } as Record<string, number>)[stem.id] ?? 0;
+                  if (settings.stem_solo > 0) updateSetting('stem_solo' as keyof MasteringSettings, soloIdx);
+                }}
                 className={`flex-1 text-[9px] font-bold py-1.5 rounded-sm transition-all ${activeStem === stem.id ? 'bg-[var(--accent)] text-black' : 'text-[var(--text-dim)] hover:bg-[#1a1c22] hover:text-white'}`}
               >
                 {stem.label}
               </button>
             ))}
+            {(() => {
+              const soloIdx = ({ bass: 1, vocal: 2, mid: 3, side: 4 } as Record<string, number>)[activeStem] ?? 0;
+              const soloOn = settings.stem_solo > 0;
+              return (
+                <button
+                  data-testid="stem-solo"
+                  disabled={soloIdx === 0}
+                  onClick={() => updateSetting('stem_solo' as keyof MasteringSettings, soloOn ? 0 : soloIdx)}
+                  title={(t as any).stemSolo || 'Solo'}
+                  className={`px-2 text-[9px] font-bold py-1.5 rounded-sm transition-all border ${soloIdx === 0 ? 'opacity-30 border-[#222] text-[var(--text-dim)]' : soloOn ? 'bg-[#ff3366] text-black border-[#ff3366]' : 'border-[var(--border)] text-[var(--text-dim)] hover:text-white'}`}
+                >
+                  {(t as any).stemSolo || 'SOLO'}
+                </button>
+              );
+            })()}
+            <button
+              data-testid="export-stems"
+              disabled={stemsExportBusy || monitoringMode !== 'master'}
+              onClick={handleExportStems}
+              title={(t as any).exportStems || 'Export Stems'}
+              className="px-2 text-[9px] font-bold py-1.5 rounded-sm transition-all border border-[var(--border)] text-[var(--text-dim)] hover:text-white disabled:opacity-30"
+            >
+              {stemsExportBusy ? '…' : ((t as any).exportStems || 'STEMS ⬇')}
+            </button>
           </div>
 
           {/* FX Settings row */}
@@ -2282,6 +2364,7 @@ export default function App() {
                             >
                               <option className="bg-black" value="master">{(t as any).stemMaster || 'MASTER'}</option>
                               <option className="bg-black" value="bass">{(t as any).stemBass || 'BASS'}</option>
+                              <option className="bg-black" value="vocal">{(t as any).stemVocal || 'VOCAL'}</option>
                               <option className="bg-black" value="mid">{(t as any).stemMid || 'MID'}</option>
                               <option className="bg-black" value="side">{(t as any).stemSide || 'SIDE'}</option>
                             </select>
@@ -2331,6 +2414,7 @@ export default function App() {
               </div>
             )}
           </div>
+          <VocalAlignPanel t={t} bitDepth={proWavBit} showToast={showToast} />
           </>)}
 
           {/* Seek Bar (own 10 Hz time state — keeps App off the hot path) */}
@@ -2589,6 +2673,25 @@ export default function App() {
                     </div>
                     {videoBgMode === 'pexels' && (
                       <div className="mt-2 space-y-2">
+                        <div>
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={pexelsKeyInput}
+                            onChange={(e) => {
+                              setPexelsKeyInput(e.target.value);
+                              setPexelsKey(e.target.value);
+                              setPexelsHasKey(hasPexelsKey());
+                            }}
+                            placeholder={(t as any).pexelsKeyPlaceholder || "Pexels API key (free at pexels.com/api)"}
+                            className="w-full bg-black border border-[var(--border)] rounded-sm px-2 py-2 text-[11px] focus:outline-none"
+                          />
+                          <p className="mt-1 text-[9px] font-mono text-[var(--text-dim)]">
+                            {pexelsHasKey
+                              ? ((t as any).pexelsKeyHint || 'Stored only on this device')
+                              : ((t as any).pexelsNoKey || 'Add your Pexels API key to search — get one free at pexels.com/api')}
+                          </p>
+                        </div>
                         <div className="flex gap-1.5">
                           <input
                             type="text"

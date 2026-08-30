@@ -86,6 +86,14 @@ export interface MasteringSettings {
   side_distortion: number;
   side_delay: number;
   side_chorus: number;
+  // Vocal Stem FX (center 200 Hz–8 kHz band)
+  vocal_autotune: number;
+  vocal_reverb: number;
+  vocal_distortion: number;
+  vocal_delay: number;
+  vocal_chorus: number;
+  // Stem solo preview: 0 = master, 1 = bass, 2 = vocal, 3 = mid, 4 = side
+  stem_solo: number;
   // Parametric EQ (4 bands; freq 0..100 log-scaled 20Hz..20kHz, type 0/1/2)
   peq1Freq: number;
   peq1Q: number;
@@ -143,7 +151,7 @@ export interface TrackMetadata {
 export type ExportFormat = 'wav' | 'mp3' | 'aac' | 'flac';
 export type ExportQuality = 'low' | 'medium' | 'high' | 'ultra';
 
-export type TargetStem = 'master' | 'bass' | 'mid' | 'side';
+export type TargetStem = 'master' | 'bass' | 'vocal' | 'mid' | 'side';
 
 export interface EffectRegion {
   id: string;

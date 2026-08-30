@@ -30,6 +30,7 @@ const TERMS = new Set([
   'pexelsBg', 'searchPexels',  // Pexels — brand
   'modeLite', 'modePro',       // product mode names
   'stemMaster', 'stemBass', 'stemMid', 'stemSide',     // all-caps stem labels
+  'stemVocal', 'stemSolo',      // all-caps stem labels; VOCAL/SOLO used as-is in es/fr/it audio UIs
   'haas',           // Haas effect — named after its inventor
   'autotune', 'chorus', 'delay', 'deess', 'reverb', 'phaser',  // established FX names (invented/brand words, kept in EN in localized audio UIs)
   'visCircle',      // Glitch — genre name
@@ -47,6 +48,7 @@ const TERMS = new Set([
   'gate', 'trans', 'air', 'widener',         // DSP module names — industry-standard EN labels (class of "Parametric EQ")
   'mono',         // Mono — standard Latin label in audio UIs
   'bit16', 'bit24', // 16/24-bit — universal bit-depth designations
+  'alignDlAligned', // "WAV" — universal format designation
 ]);
 
 // Cognates / established loanwords, per language: the EN value IS the
@@ -55,11 +57,14 @@ const PER_LANG_TERMS = {
   it: new Set(['volume', 'master', 'presetClub', 'presetRadio', 'presetPodcast',
     'profileStreaming', 'stageLoudness', 'tremolo', 'videoAuthor', 'mono',
     'bitrate',    // "bitrate" — italian word
-    'batchStop']),// "Stop" — italian word
+    'batchStop',  // "Stop" — italian word
+    'alignDlMix']),// "Mix" — loanword used as-is in italian audio UIs
   fr: new Set(['format', 'monitoring', 'volume', 'master', 'presetClub', 'presetRadio',
     'presetPodcast', 'batchStop', 'peqType', 'mono', 'tremolo', 'source',
     'original', 'orientation', 'vertical', 'horizontal', 'profileStreaming',
-    'stageTexture', 'stageLoudness']),
+    'stageTexture', 'stageLoudness',
+    'alignGuide', // "Guide" — french word
+    'alignDlMix']),// "Mix" — loanword used as-is in french audio UIs
   es: new Set(['master', 'natural', 'presets', 'fundamental', 'format', 'original',
     'vertical', 'horizontal', 'presetClub', 'presetRadio', 'presetPodcast',
     'profileStreaming', 'stageLoudness', 'tremolo', 'mono', 'batchStop']),
