@@ -1,6 +1,6 @@
 {
   "appId": "com.neuralmasterpro.app",
-  "productName": "Neural Master Pro 2.4",
+  "productName": "Neural Master Pro 2.5",
   "directories": {
     "buildResources": "public",
     "output": "release"
@@ -8,6 +8,7 @@
   "files": [
     "dist/**/*",
     "main.cjs",
+    "preload.cjs",
     "public/logo.ico"
   ],
   "extraResources": [
