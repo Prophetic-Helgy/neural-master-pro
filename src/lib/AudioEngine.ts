@@ -1,5 +1,5 @@
 import { MasteringSettings, AudioSnapshot, TimelinePoint, EffectRegion } from '../types';
-import { FaustCompiler, FaustMonoDspGenerator, LibFaust, instantiateFaustModuleFromFile } from "@grame/faustwasm";
+import { FaustCompiler, FaustMonoDspGenerator, FaustMonoOfflineProcessor, LibFaust, instantiateFaustModuleFromFile } from "@grame/faustwasm";
 import masteringDsp from '../dsp/mastering.dsp?raw';
 import {
   analyzeTone,
@@ -87,6 +87,13 @@ export class AudioEngine {
   // Faust
   private faustNode: any = null;
   private compiler: FaustCompiler | null = null;
+  // Compiled once and reused — generator.compile() re-runs the Faust LLVM
+  // toolchain in wasm (~0.5 s) on every call, and a fresh generator per
+  // export made every export pay for it.
+  private exportGenerator: FaustMonoDspGenerator | null = null;
+  private analysisGenerator: FaustMonoDspGenerator | null = null;
+  // Offline DSP instances are reused per generator — see renderOfflineDsp.
+  private offlineDspCache = new WeakMap<FaustMonoDspGenerator, { proc: FaustMonoOfflineProcessor; sampleRate: number }>();
   private isInitialized: boolean = false;
   
   // Automation
@@ -181,29 +188,37 @@ export class AudioEngine {
   private async initFaust() {
     console.log("Starting Faust Engine Initialization...");
     try {
-      let wasmJs = "https://unpkg.com/@grame/faustwasm@0.16.1/libfaust-wasm/libfaust-wasm.js";
-      let wasmData = "https://unpkg.com/@grame/faustwasm@0.16.1/libfaust-wasm/libfaust-wasm.data";
-      let wasmWasm = "https://unpkg.com/@grame/faustwasm@0.16.1/libfaust-wasm/libfaust-wasm.wasm";
-
+      // Try the bundled copy first in every served context (dev server,
+      // preview, app://bundle); unpkg remains the fallback for a plain
+      // browser tab that loads the bundle from a server without /faust/.
+      const CDN = ["https://unpkg.com/@grame/faustwasm@0.16.1/libfaust-wasm/libfaust-wasm.js", "https://unpkg.com/@grame/faustwasm@0.16.1/libfaust-wasm/libfaust-wasm.data", "https://unpkg.com/@grame/faustwasm@0.16.1/libfaust-wasm/libfaust-wasm.wasm"];
+      const attempts: string[][] = [];
       if (typeof window !== 'undefined' && (window as any).process?.type === 'renderer') {
         if (window.location.protocol === 'file:') {
           const basePath = window.location.href.substring(0, window.location.href.lastIndexOf('/'));
-          wasmJs = `${basePath}/faust/libfaust-wasm.js`;
-          wasmData = `${basePath}/faust/libfaust-wasm.data`;
-          wasmWasm = `${basePath}/faust/libfaust-wasm.wasm`;
+          attempts.push([`${basePath}/faust/libfaust-wasm.js`, `${basePath}/faust/libfaust-wasm.data`, `${basePath}/faust/libfaust-wasm.wasm`]);
         } else {
-          wasmJs = "/faust/libfaust-wasm.js";
-          wasmData = "/faust/libfaust-wasm.data";
-          wasmWasm = "/faust/libfaust-wasm.wasm";
+          attempts.push(["/faust/libfaust-wasm.js", "/faust/libfaust-wasm.data", "/faust/libfaust-wasm.wasm"]);
+        }
+      } else if (typeof window !== 'undefined' && window.location.protocol.startsWith('http')) {
+        attempts.push(["/faust/libfaust-wasm.js", "/faust/libfaust-wasm.data", "/faust/libfaust-wasm.wasm"]);
+      }
+      attempts.push(CDN);
+
+      let faustModule: any = null;
+      let lastErr: any = null;
+      for (const [wasmJs, wasmData, wasmWasm] of attempts) {
+        try {
+          faustModule = await Promise.race([
+            instantiateFaustModuleFromFile(wasmJs, wasmData, wasmWasm),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Faust Engine Load Timeout (>10s)")), 10000))
+          ]);
+          break;
+        } catch (err) {
+          lastErr = err;
         }
       }
-
-      const faustModule = await Promise.race([
-        instantiateFaustModuleFromFile(wasmJs, wasmData, wasmWasm),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Faust Engine Load Timeout (>10s)")), 10000))
-      ]).catch((err: any) => {
-        throw new Error(`Failed to load Faust WASM assets: ${err.message || err}`);
-      }) as any;
+      if (!faustModule) throw new Error(`Failed to load Faust WASM assets: ${(lastErr && lastErr.message) || lastErr}`);
 
       const libFaust = new LibFaust(faustModule);
       this.compiler = new FaustCompiler(libFaust);
@@ -565,41 +580,31 @@ export class AudioEngine {
     if (endSec <= startSec) endSec = startSec + 1;
 
     const exportDuration = endSec - startSec;
-    const length = Math.ceil(exportDuration * this.buffer.sampleRate);
-    const renderContext = new OfflineAudioContext(2, length, this.buffer.sampleRate);
-    
-    // Create Faust Node for Offline Context
-    const generator = new FaustMonoDspGenerator();
-    await generator.compile(this.compiler, "mastering_export", masteringDsp, "");
-    const offlineFaustNode = await generator.createNode(renderContext);
+    const sampleRate = this.buffer.sampleRate;
+    const length = Math.ceil(exportDuration * sampleRate);
 
-    if (!offlineFaustNode) return null;
+    // generator compiled once, reused (the DSP instance itself is created
+    // per render inside renderOfflineDsp — fresh state each export)
+    if (!this.exportGenerator) {
+      const gen = new FaustMonoDspGenerator();
+      await gen.compile(this.compiler, "mastering_export", masteringDsp, "");
+      this.exportGenerator = gen;
+    }
 
-    // Apply settings to offline node
-    const setParam = (name: string, val: number) => {
-      try {
-        if (offlineFaustNode) {
-          const params = offlineFaustNode.getParams();
-          const targetSuffix = `/${name}`;
-          const exactPath = `/mastering_export/${name}`;
-          if (params.includes(exactPath)) {
-            offlineFaustNode.setParamValue(exactPath, val);
-          } else {
-            const matchingParam = params.find((p: string) => p.endsWith(targetSuffix) || p === name);
-            if (matchingParam) offlineFaustNode.setParamValue(matchingParam, val);
-          }
-        }
-      } catch (e) { }
-    };
+    const srcL0 = this.buffer.getChannelData(0);
+    const srcR0 = this.buffer.numberOfChannels > 1 ? this.buffer.getChannelData(1) : srcL0;
+    const startSample = Math.min(Math.floor(startSec * sampleRate), srcL0.length, srcR0.length);
+    const srcL = srcL0.subarray(startSample);
+    const srcR = srcR0.subarray(startSample);
 
-    const applyParams = (t: number) => {
+    const applyParams = (setParam: (name: string, val: number) => void, t: number) => {
       const activeRegions = regions.filter(r => t >= r.start && t < r.end);
       const stems: ('master' | 'bass' | 'vocal' | 'mid' | 'side')[] = ['master', 'bass', 'vocal', 'mid', 'side'];
 
       stems.forEach(stem => {
         const region = activeRegions.find(r => r.targetStem === stem);
         const prefix = stem === 'master' ? '' : `${stem}_`;
-        
+
         if (region) {
           setParam(`${prefix}autotune`, region.effects.autotune);
           setParam(`${prefix}reverb`, region.effects.reverb);
@@ -616,104 +621,204 @@ export class AudioEngine {
       });
     };
 
-    setParam("gain", settings.gain);
-    setParam("lowShelf", settings.lowShelf);
-    setParam("midRange", settings.midRange);
-    setParam("highShelf", settings.highShelf);
-    setParam("compression", settings.compression);
-    setParam("limiter", settings.limiter);
-    setParam("saturation", settings.saturation);
-    setParam("exciterAmount", settings.exciterAmount);
-    setParam("exciterFreq", settings.exciterFreq);
-    setParam("haasAmount", settings.haasAmount);
-    setParam("stereoWidth", settings.stereoWidth);
-    setParam("fundamentalFreq", settings.fundamentalFreq);
-    setParam("eq31", settings.eq31);
-    setParam("eq62", settings.eq62);
-    setParam("eq125", settings.eq125);
-    setParam("eq250", settings.eq250);
-    setParam("eq500", settings.eq500);
-    setParam("eq1k", settings.eq1k);
-    setParam("eq2k", settings.eq2k);
-    setParam("eq4k", settings.eq4k);
-    setParam("eq8k", settings.eq8k);
-    setParam("eq16k", settings.eq16k);
-    setParam("peq1Freq", settings.peq1Freq);
-    setParam("peq1Q", settings.peq1Q);
-    setParam("peq1Gain", settings.peq1Gain);
-    setParam("peq1Type", settings.peq1Type);
-    setParam("peq2Freq", settings.peq2Freq);
-    setParam("peq2Q", settings.peq2Q);
-    setParam("peq2Gain", settings.peq2Gain);
-    setParam("peq2Type", settings.peq2Type);
-    setParam("peq3Freq", settings.peq3Freq);
-    setParam("peq3Q", settings.peq3Q);
-    setParam("peq3Gain", settings.peq3Gain);
-    setParam("peq3Type", settings.peq3Type);
-    setParam("peq4Freq", settings.peq4Freq);
-    setParam("peq4Q", settings.peq4Q);
-    setParam("peq4Gain", settings.peq4Gain);
-    setParam("peq4Type", settings.peq4Type);
-    setParam("widenerAmt", settings.widenerAmt);
-    setParam("mono", settings.mono);
-    setParam("compAmt", settings.compAmt);
-    setParam("compThresh", settings.compThresh);
-    setParam("compRatio", settings.compRatio);
-    setParam("compAttack", settings.compAttack);
-    setParam("compRelease", settings.compRelease);
-    setParam("gateAmt", settings.gateAmt);
-    setParam("gateThresh", settings.gateThresh);
-    setParam("gateRelease", settings.gateRelease);
-    setParam("transAmt", settings.transAmt);
-    setParam("transFreq", settings.transFreq);
-    setParam("deessAmt", settings.deessAmt);
-    setParam("deessFreq", settings.deessFreq);
-    setParam("tapeAmt", settings.tapeAmt);
-    setParam("tapeTone", settings.tapeTone);
-    setParam("airAmt", settings.airAmt);
-    setParam("airFreq", settings.airFreq);
-    setParam("phaserAmt", settings.phaserAmt);
-    setParam("flangerAmt", settings.flangerAmt);
-    setParam("tremoloAmt", settings.tremoloAmt);
-    setParam("bitDepth", settings.bitDepth);
-    setParam("srHold", settings.srHold);
-    setParam("stem_solo", settings.stem_solo ?? 0);
-    applyParams(startSec);
+    // Captured by the automation closures below — bound when setAll runs.
+    let setParamLive: (name: string, val: number) => void = () => { /* bound in setAll */ };
 
-    // Schedule suspensions for automation
+    const setAll = (setParam: (name: string, val: number) => void) => {
+      setParamLive = setParam;
+      setParam("gain", settings.gain);
+      setParam("lowShelf", settings.lowShelf);
+      setParam("midRange", settings.midRange);
+      setParam("highShelf", settings.highShelf);
+      setParam("compression", settings.compression);
+      setParam("limiter", settings.limiter);
+      setParam("saturation", settings.saturation);
+      setParam("exciterAmount", settings.exciterAmount);
+      setParam("exciterFreq", settings.exciterFreq);
+      setParam("haasAmount", settings.haasAmount);
+      setParam("stereoWidth", settings.stereoWidth);
+      setParam("fundamentalFreq", settings.fundamentalFreq);
+      setParam("eq31", settings.eq31);
+      setParam("eq62", settings.eq62);
+      setParam("eq125", settings.eq125);
+      setParam("eq250", settings.eq250);
+      setParam("eq500", settings.eq500);
+      setParam("eq1k", settings.eq1k);
+      setParam("eq2k", settings.eq2k);
+      setParam("eq4k", settings.eq4k);
+      setParam("eq8k", settings.eq8k);
+      setParam("eq16k", settings.eq16k);
+      setParam("peq1Freq", settings.peq1Freq);
+      setParam("peq1Q", settings.peq1Q);
+      setParam("peq1Gain", settings.peq1Gain);
+      setParam("peq1Type", settings.peq1Type);
+      setParam("peq2Freq", settings.peq2Freq);
+      setParam("peq2Q", settings.peq2Q);
+      setParam("peq2Gain", settings.peq2Gain);
+      setParam("peq2Type", settings.peq2Type);
+      setParam("peq3Freq", settings.peq3Freq);
+      setParam("peq3Q", settings.peq3Q);
+      setParam("peq3Gain", settings.peq3Gain);
+      setParam("peq3Type", settings.peq3Type);
+      setParam("peq4Freq", settings.peq4Freq);
+      setParam("peq4Q", settings.peq4Q);
+      setParam("peq4Gain", settings.peq4Gain);
+      setParam("peq4Type", settings.peq4Type);
+      setParam("widenerAmt", settings.widenerAmt);
+      setParam("mono", settings.mono);
+      setParam("compAmt", settings.compAmt);
+      setParam("compThresh", settings.compThresh);
+      setParam("compRatio", settings.compRatio);
+      setParam("compAttack", settings.compAttack);
+      setParam("compRelease", settings.compRelease);
+      setParam("gateAmt", settings.gateAmt);
+      setParam("gateThresh", settings.gateThresh);
+      setParam("gateRelease", settings.gateRelease);
+      setParam("transAmt", settings.transAmt);
+      setParam("transFreq", settings.transFreq);
+      setParam("deessAmt", settings.deessAmt);
+      setParam("deessFreq", settings.deessFreq);
+      setParam("tapeAmt", settings.tapeAmt);
+      setParam("tapeTone", settings.tapeTone);
+      setParam("airAmt", settings.airAmt);
+      setParam("airFreq", settings.airFreq);
+      setParam("phaserAmt", settings.phaserAmt);
+      setParam("flangerAmt", settings.flangerAmt);
+      setParam("tremoloAmt", settings.tremoloAmt);
+      setParam("bitDepth", settings.bitDepth);
+      setParam("srHold", settings.srHold);
+      setParam("stem_solo", settings.stem_solo ?? 0);
+      applyParams(setParam, startSec);
+    };
+
+    // Region automation: re-apply the active region set at every boundary
+    // (render-block quantized), same semantics the old OfflineAudioContext
+    // suspend/resume path had at quantum granularity.
+    const automation: { at: number; apply: () => void }[] = [];
     if (regions.length > 0) {
       const times = new Set<number>();
       for (const r of regions) {
         if (r.start > startSec && r.start < endSec) times.add(r.start - startSec);
         if (r.end > startSec && r.end < endSec) times.add(r.end - startSec);
       }
-      
-      const sortedTimes = Array.from(times).sort((a,b) => a - b);
-      for (const t of sortedTimes) {
-        renderContext.suspend(t).then(() => {
-          applyParams(startSec + t);
-          renderContext.resume();
-        });
+      for (const t of Array.from(times).sort((a, b) => a - b)) {
+        automation.push({ at: t, apply: () => applyParams(setParamLive, startSec + t) });
       }
     }
 
-    const source = renderContext.createBufferSource();
-    source.buffer = this.buffer;
+    const out = await this.renderOfflineDsp(this.exportGenerator, sampleRate, srcL, srcR, length, setAll, automation);
+    if (!out) return null;
+    return { left: out.left, right: out.right, sampleRate };
+  }
 
-    source.connect(offlineFaustNode);
-    offlineFaustNode.connect(renderContext.destination);
+  /**
+   * Render PCM straight through the compiled wasm DSP — no AudioContext, no
+   * worklet. Why: Blink pins every AudioContext that ever called
+   * `audioWorklet.addModule()` forever (no JS teardown helps — node.destroy()
+   * and port.close() free only DSP internals), and each pin retains that
+   * context's worklet DSP wasm linear memory. One-shot OfflineAudioContext
+   * exports therefore accumulate tens of MB each and end in
+   * "WebAssembly.Instance(): Out of memory" after a few dozen exports in one
+   * session. FaustOfflineProcessor drives the identical wasm DSP through
+   * direct function calls, so instances are plain JS-owned and GC-reachable.
+   * The loop yields ~every 50 ms to keep the UI responsive on long tracks.
+   * `automation` events fire before the first block at/after their time.
+   */
+  private async renderOfflineDsp(
+    generator: FaustMonoDspGenerator,
+    sampleRate: number,
+    srcL: Float32Array,
+    srcR: Float32Array,
+    outLength: number,
+    setAll: (setParam: (name: string, val: number) => void) => void,
+    automation: { at: number; apply: () => void }[] = [],
+  ): Promise<{ left: Float32Array; right: Float32Array } | null> {
+    // Reuse one wasm DSP instance per generator: proc.init() re-runs the
+    // generated instance init (zeroes DSP memory, resets params to their
+    // UI defaults — and the caller re-applies every setting right after),
+    // which is exactly what a freshly created instance had. A per-export
+    // wasm instance instead leaves its multi-MB linear memory to the GC —
+    // ~48 exports in one suite run measured a single ~110 ms GC pause that
+    // dropped a frame in steady-state playback (M4.3 gate).
+    let cached = this.offlineDspCache.get(generator);
+    if (!cached || cached.sampleRate !== sampleRate) {
+      const created = await generator.createOfflineProcessor(sampleRate, 1024);
+      if (!created) return null;
+      // mastering.dsp is pinned to 2-in/2-out (`par(i, 2, ...)`); the old
+      // Web Audio graph passed stereo straight through with no channel
+      // mixing, so feeding/collecting L+R keeps the semantics identical.
+      if (created.getNumInputs() !== 2 || created.getNumOutputs() !== 2) {
+        try { created.destroy(); } catch { /* ignore */ }
+        return null;
+      }
+      cached = { proc: created, sampleRate };
+      this.offlineDspCache.set(generator, cached);
+    } else {
+      cached.proc.init();
+    }
+    const proc = cached.proc;
+    try {
+      const paramPaths: string[] = proc.getParams();
+      const first = paramPaths[0] || '';
+      const prefix = first.slice(0, first.lastIndexOf('/')); // e.g. '/mastering_export'
+      const setParam = (name: string, val: number) => {
+        try {
+          const exact = `${prefix}/${name}`;
+          if (paramPaths.includes(exact)) {
+            proc.setParamValue(exact, val);
+          } else {
+            const matchingParam = paramPaths.find((p: string) => p.endsWith(`/${name}`) || p === name);
+            if (matchingParam) proc.setParamValue(matchingParam, val);
+          }
+        } catch { /* param not in this DSP build */ }
+      };
+      setAll(setParam);
 
-    const playDuration = Math.max(0, this.buffer.duration - startSec);
-    source.start(0, startSec, playDuration);
-    const rendered = await renderContext.startRendering();
-
-    // OfflineAudioContext is created with 2 channels, so both exist
-    // (mono sources are upmixed).
-    return {
-      left: rendered.getChannelData(0),
-      right: rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : rendered.getChannelData(0),
-      sampleRate: rendered.sampleRate,
-    };
+      const BLK = 1024; // compute() always renders exactly fBufferSize
+      const left = new Float32Array(outLength);
+      const right = new Float32Array(outLength);
+      const inL = new Float32Array(BLK);
+      const inR = new Float32Array(BLK);
+      const outB = [new Float32Array(BLK), new Float32Array(BLK)];
+      const events = automation.slice().sort((a, b) => a.at - b.at);
+      let ei = 0;
+      let yieldAt = performance.now() + 50;
+      proc.start();
+      for (let off = 0; off < outLength; off += BLK) {
+        const t = off / sampleRate;
+        while (ei < events.length && events[ei].at <= t) { events[ei].apply(); ei += 1; }
+        const avail = Math.min(BLK, srcL.length - off);
+        if (avail >= BLK) {
+          inL.set(srcL.subarray(off, off + BLK));
+          inR.set(srcR.subarray(off, off + BLK));
+        } else {
+          if (avail > 0) {
+            inL.set(srcL.subarray(off, off + avail));
+            inR.set(srcR.subarray(off, off + avail));
+          }
+          inL.fill(0, Math.max(avail, 0)); // tail block: silence through the DSP
+          inR.fill(0, Math.max(avail, 0)); // (reverb/delay decay), as before
+        }
+        proc.compute([inL, inR], outB);
+        const cnt = Math.min(BLK, outLength - off);
+        left.set(outB[0].subarray(0, cnt), off);
+        right.set(outB[1].subarray(0, cnt), off);
+        if (performance.now() > yieldAt) {
+          await new Promise((r) => setTimeout(r, 0));
+          yieldAt = performance.now() + 50;
+        }
+      }
+      proc.stop();
+      return { left, right };
+    } catch (e) {
+      // A poisoned instance must not stay cached — drop and destroy it so
+      // the next render builds a fresh one.
+      this.offlineDspCache.delete(generator);
+      try { proc.destroy(); } catch { /* ignore */ }
+      throw e;
+    }
+    // The instance is deliberately NOT destroyed: it is cached for reuse
+    // (see above); destroying it hands its wasm memory to the GC.
   }
 
   public getContext() {
@@ -1040,126 +1145,119 @@ export class AudioEngine {
     }
 
     const renderLength = 5;
-    const offlineCtx = new OfflineAudioContext(2, 44100 * renderLength, 44100);
 
-    // Create Faust Node for Analysis
-    const generator = new FaustMonoDspGenerator();
-    await generator.compile(this.compiler, "mastering_analysis", masteringDsp, "");
-    const analysisNode = await generator.createNode(offlineCtx);
+    if (!this.analysisGenerator) {
+      const gen = new FaustMonoDspGenerator();
+      await gen.compile(this.compiler, "mastering_analysis", masteringDsp, "");
+      this.analysisGenerator = gen;
+    }
 
-    if (!analysisNode) return null;
+    // Resample the segment to the analysis rate on a PLAIN offline context
+    // (no worklet → no Blink pin, GC-collected normally — see renderOfflineDsp).
+    const resampleCtx = new OfflineAudioContext(2, 44100 * renderLength, 44100);
+    const resampleSrc = resampleCtx.createBufferSource();
+    resampleSrc.buffer = this.buffer;
+    resampleSrc.connect(resampleCtx.destination);
+    resampleSrc.start(0, loudestStart);
+    const resampled = await resampleCtx.startRendering();
 
-    // Apply settings to analysis node
-    const setParam = (name: string, val: number) => {
-      try {
-        if (analysisNode) {
-          const params = analysisNode.getParams();
-          const targetSuffix = `/${name}`;
-          const exactPath = `/mastering_analysis/${name}`;
-          if (params.includes(exactPath)) {
-            analysisNode.setParamValue(exactPath, val);
-          } else {
-            const matchingParam = params.find((p: string) => p.endsWith(targetSuffix) || p === name);
-            if (matchingParam) analysisNode.setParamValue(matchingParam, val);
-          }
-        }
-      } catch (e) { }
+    const setAll = (setParam: (name: string, val: number) => void) => {
+      setParam("gain", settings.gain);
+      setParam("lowShelf", settings.lowShelf);
+      setParam("midRange", settings.midRange);
+      setParam("highShelf", settings.highShelf);
+      setParam("compression", settings.compression);
+      setParam("limiter", settings.limiter);
+      setParam("saturation", settings.saturation);
+      setParam("exciterAmount", settings.exciterAmount);
+      setParam("exciterFreq", settings.exciterFreq);
+      setParam("haasAmount", settings.haasAmount);
+      setParam("stereoWidth", settings.stereoWidth);
+      setParam("fundamentalFreq", settings.fundamentalFreq);
+      setParam("eq31", settings.eq31);
+      setParam("eq62", settings.eq62);
+      setParam("eq125", settings.eq125);
+      setParam("eq250", settings.eq250);
+      setParam("eq500", settings.eq500);
+      setParam("eq1k", settings.eq1k);
+      setParam("eq2k", settings.eq2k);
+      setParam("eq4k", settings.eq4k);
+      setParam("eq8k", settings.eq8k);
+      setParam("eq16k", settings.eq16k);
+      setParam("autotune", settings.autotune);
+      setParam("reverb", settings.reverb);
+      setParam("distortion", settings.distortion);
+      setParam("delay", settings.delay);
+      setParam("chorus", settings.chorus);
+
+      setParam("bass_autotune", settings.bass_autotune);
+      setParam("bass_reverb", settings.bass_reverb);
+      setParam("bass_distortion", settings.bass_distortion);
+      setParam("bass_delay", settings.bass_delay);
+      setParam("bass_chorus", settings.bass_chorus);
+
+      setParam("mid_autotune", settings.mid_autotune);
+      setParam("mid_reverb", settings.mid_reverb);
+      setParam("mid_distortion", settings.mid_distortion);
+      setParam("mid_delay", settings.mid_delay);
+      setParam("mid_chorus", settings.mid_chorus);
+
+      setParam("side_autotune", settings.side_autotune);
+      setParam("side_reverb", settings.side_reverb);
+      setParam("side_distortion", settings.side_distortion);
+      setParam("side_delay", settings.side_delay);
+      setParam("side_chorus", settings.side_chorus);
+
+      setParam("peq1Freq", settings.peq1Freq);
+      setParam("peq1Q", settings.peq1Q);
+      setParam("peq1Gain", settings.peq1Gain);
+      setParam("peq1Type", settings.peq1Type);
+      setParam("peq2Freq", settings.peq2Freq);
+      setParam("peq2Q", settings.peq2Q);
+      setParam("peq2Gain", settings.peq2Gain);
+      setParam("peq2Type", settings.peq2Type);
+      setParam("peq3Freq", settings.peq3Freq);
+      setParam("peq3Q", settings.peq3Q);
+      setParam("peq3Gain", settings.peq3Gain);
+      setParam("peq3Type", settings.peq3Type);
+      setParam("peq4Freq", settings.peq4Freq);
+      setParam("peq4Q", settings.peq4Q);
+      setParam("peq4Gain", settings.peq4Gain);
+      setParam("peq4Type", settings.peq4Type);
+      setParam("widenerAmt", settings.widenerAmt);
+      setParam("mono", settings.mono);
+      setParam("compAmt", settings.compAmt);
+      setParam("compThresh", settings.compThresh);
+      setParam("compRatio", settings.compRatio);
+      setParam("compAttack", settings.compAttack);
+      setParam("compRelease", settings.compRelease);
+      setParam("gateAmt", settings.gateAmt);
+      setParam("gateThresh", settings.gateThresh);
+      setParam("gateRelease", settings.gateRelease);
+      setParam("transAmt", settings.transAmt);
+      setParam("transFreq", settings.transFreq);
+      setParam("deessAmt", settings.deessAmt);
+      setParam("deessFreq", settings.deessFreq);
+      setParam("tapeAmt", settings.tapeAmt);
+      setParam("tapeTone", settings.tapeTone);
+      setParam("airAmt", settings.airAmt);
+      setParam("airFreq", settings.airFreq);
+      setParam("phaserAmt", settings.phaserAmt);
+      setParam("flangerAmt", settings.flangerAmt);
+      setParam("tremoloAmt", settings.tremoloAmt);
+      setParam("bitDepth", settings.bitDepth);
+      setParam("srHold", settings.srHold);
     };
 
-    setParam("gain", settings.gain);
-    setParam("lowShelf", settings.lowShelf);
-    setParam("midRange", settings.midRange);
-    setParam("highShelf", settings.highShelf);
-    setParam("compression", settings.compression);
-    setParam("limiter", settings.limiter);
-    setParam("saturation", settings.saturation);
-    setParam("exciterAmount", settings.exciterAmount);
-    setParam("exciterFreq", settings.exciterFreq);
-    setParam("haasAmount", settings.haasAmount);
-    setParam("stereoWidth", settings.stereoWidth);
-    setParam("fundamentalFreq", settings.fundamentalFreq);
-    setParam("eq31", settings.eq31);
-    setParam("eq62", settings.eq62);
-    setParam("eq125", settings.eq125);
-    setParam("eq250", settings.eq250);
-    setParam("eq500", settings.eq500);
-    setParam("eq1k", settings.eq1k);
-    setParam("eq2k", settings.eq2k);
-    setParam("eq4k", settings.eq4k);
-    setParam("eq8k", settings.eq8k);
-    setParam("eq16k", settings.eq16k);
-    setParam("autotune", settings.autotune);
-    setParam("reverb", settings.reverb);
-    setParam("distortion", settings.distortion);
-    setParam("delay", settings.delay);
-    setParam("chorus", settings.chorus);
-
-    setParam("bass_autotune", settings.bass_autotune);
-    setParam("bass_reverb", settings.bass_reverb);
-    setParam("bass_distortion", settings.bass_distortion);
-    setParam("bass_delay", settings.bass_delay);
-    setParam("bass_chorus", settings.bass_chorus);
-
-    setParam("mid_autotune", settings.mid_autotune);
-    setParam("mid_reverb", settings.mid_reverb);
-    setParam("mid_distortion", settings.mid_distortion);
-    setParam("mid_delay", settings.mid_delay);
-    setParam("mid_chorus", settings.mid_chorus);
-
-    setParam("side_autotune", settings.side_autotune);
-    setParam("side_reverb", settings.side_reverb);
-    setParam("side_distortion", settings.side_distortion);
-    setParam("side_delay", settings.side_delay);
-    setParam("side_chorus", settings.side_chorus);
-
-    setParam("peq1Freq", settings.peq1Freq);
-    setParam("peq1Q", settings.peq1Q);
-    setParam("peq1Gain", settings.peq1Gain);
-    setParam("peq1Type", settings.peq1Type);
-    setParam("peq2Freq", settings.peq2Freq);
-    setParam("peq2Q", settings.peq2Q);
-    setParam("peq2Gain", settings.peq2Gain);
-    setParam("peq2Type", settings.peq2Type);
-    setParam("peq3Freq", settings.peq3Freq);
-    setParam("peq3Q", settings.peq3Q);
-    setParam("peq3Gain", settings.peq3Gain);
-    setParam("peq3Type", settings.peq3Type);
-    setParam("peq4Freq", settings.peq4Freq);
-    setParam("peq4Q", settings.peq4Q);
-    setParam("peq4Gain", settings.peq4Gain);
-    setParam("peq4Type", settings.peq4Type);
-    setParam("widenerAmt", settings.widenerAmt);
-    setParam("mono", settings.mono);
-    setParam("compAmt", settings.compAmt);
-    setParam("compThresh", settings.compThresh);
-    setParam("compRatio", settings.compRatio);
-    setParam("compAttack", settings.compAttack);
-    setParam("compRelease", settings.compRelease);
-    setParam("gateAmt", settings.gateAmt);
-    setParam("gateThresh", settings.gateThresh);
-    setParam("gateRelease", settings.gateRelease);
-    setParam("transAmt", settings.transAmt);
-    setParam("transFreq", settings.transFreq);
-    setParam("deessAmt", settings.deessAmt);
-    setParam("deessFreq", settings.deessFreq);
-    setParam("tapeAmt", settings.tapeAmt);
-    setParam("tapeTone", settings.tapeTone);
-    setParam("airAmt", settings.airAmt);
-    setParam("airFreq", settings.airFreq);
-    setParam("phaserAmt", settings.phaserAmt);
-    setParam("flangerAmt", settings.flangerAmt);
-    setParam("tremoloAmt", settings.tremoloAmt);
-    setParam("bitDepth", settings.bitDepth);
-    setParam("srHold", settings.srHold);
-
-    const source = offlineCtx.createBufferSource();
-    source.buffer = this.buffer;
-
-    source.connect(analysisNode);
-    analysisNode.connect(offlineCtx.destination);
-
-    source.start(0, loudestStart);
-    const renderedBuffer = await offlineCtx.startRendering();
+    const out = await this.renderOfflineDsp(
+      this.analysisGenerator, 44100,
+      resampled.getChannelData(0), resampled.getChannelData(1),
+      44100 * renderLength, setAll,
+    );
+    if (!out) return null;
+    const renderedBuffer = new AudioBuffer({ length: 44100 * renderLength, numberOfChannels: 2, sampleRate: 44100 });
+    renderedBuffer.copyToChannel(out.left, 0);
+    renderedBuffer.copyToChannel(out.right, 1);
 
     const snap = await this.analyzeBuffer(renderedBuffer, label);
     if (!snap) return null;

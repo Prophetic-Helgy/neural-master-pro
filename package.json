@@ -1,17 +1,18 @@
 {
   "name": "neural-master-pro",
-  "productName": "Neural Master Pro 2.5",
+  "productName": "Neural Master Pro 2.6",
   "description": "Premium AI-powered audio mastering application with real-time Faust DSP engine.",
   "author": "Oleg",
   "private": true,
-  "version": "2.5.0",
+  "version": "2.6.0",
   "type": "module",
   "main": "main.cjs",
   "scripts": {
     "dev": "node copy-faust.js && node copy-ffmpeg.js && vite --port=3000 --host=0.0.0.0",
     "build": "node copy-faust.js && node copy-ffmpeg.js && vite build",
-    "build:exe": "npm run build && electron-builder --config electron-builder-portable.json --win",
+    "build:exe": "npm run fetch:models && npm run build && electron-builder --config electron-builder-portable.json --win",
     "preview": "vite preview",
+    "fetch:models": "node scripts/fetch-whisper-model.mjs",
     "lint": "tsc --noEmit"
   },
   "build": {
@@ -36,6 +37,7 @@
     "@ffmpeg/core": "0.12.10",
     "@ffmpeg/ffmpeg": "0.12.15",
     "@grame/faustwasm": "^0.16.1",
+    "@huggingface/transformers": "^4.2.0",
     "@mediabunny/flac-encoder": "^1.55.2",
     "@mediabunny/mp3-encoder": "^1.55.2",
     "clsx": "^2.1.1",

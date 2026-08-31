@@ -11,7 +11,10 @@
  *      round-trip resolves through the sandbox boundary;
  *   2. the INLINE metrics worker (base64 blob URL) runs — the production
  *      seam window.__nmp_metrics_mode === 'worker';
- *   3. the React app renders (canvases + body text).
+ *   3. the React app renders (canvases + body text);
+ *   4. (v2.6) the built ASR module worker boots under app:// — bundled
+ *      Whisper model loads via the app:// fetch path and a 1 s silence
+ *      transcribe completes (ORT wasm under 'wasm-unsafe-eval').
  *
  * The TONE fixture is read in the MAIN process and injected as base64 —
  * the sandboxed renderer has no require('fs') anymore (v2.5 pentest fix).
@@ -24,6 +27,7 @@
  */
 const { app, BrowserWindow, ipcMain, protocol, net } = require('electron');
 const path = require('path');
+const os = require('os');
 const { pathToFileURL } = require('url');
 const fs = require('fs');
 
@@ -33,8 +37,11 @@ protocol.registerSchemesAsPrivileged([
   { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
 ]);
 
-const TIMEOUT_MS = 180_000;
+const TIMEOUT_MS = 300_000; // includes the ASR step: model load under app:// takes a while
 const TONE = path.join(__dirname, '..', 'docs', 'screenshots', 'e2e_tone.wav');
+// Real-speech fixture (LibriSpeech flac, dev-time test data, never shipped) —
+// optional: without it the ASR smoke falls back to the 1 s silence probe.
+const SPEECH = path.join(os.tmpdir(), 'asr_real.flac');
 const PRELOAD = path.join(__dirname, '..', 'preload.cjs');
 const APP_PKG = require(path.join(__dirname, '..', 'package.json'));
 
@@ -186,7 +193,81 @@ app.whenReady().then(async () => {
   })()`);
 
   clearTimeout(guard);
+  // 3) Bundled Whisper model must be served under app:// (proves public/→dist
+  //    copy by electron-builder and the app:// fetch path the ASR worker uses).
+  const model = await win.webContents.executeJavaScript(`(async () => {
+    const files = ['models/whisper-base/config.json', 'models/whisper-base/tokenizer.json',
+      'models/whisper-base/onnx/encoder_model_quantized.onnx'];
+    const out = {};
+    for (const f of files) {
+      try {
+        const r = await fetch('app://bundle/' + f, { method: 'HEAD' });
+        out[f.split('/').pop()] = r.status + ':' + (r.headers.get('content-length') || '?');
+      } catch (e) { out[f.split('/').pop()] = 'ERR ' + e.message; }
+    }
+    return out;
+  })()`);
+  console.log('MODEL CHECK:', JSON.stringify(model));
+  const modelOk = Object.values(model).every((v) => String(v).startsWith('200'));
+
+  // 4) ASR worker end-to-end under app:// (v2.6 top risk): spawn the REAL
+  //    built module worker, load the bundled Whisper model through the app://
+  //    fetch handler + CSP, and transcribe REAL SPEECH (10 s LibriSpeech
+  //    fixture injected as base64, WebGPU→WASM fallback inside). Non-empty
+  //    recognized text proves worker module imports, ORT session
+  //    instantiation ('wasm-unsafe-eval'), the model stream path AND the
+  //    tokenizer/feature-extractor load all work in the packaged origin
+  //    class (a metadata-probe regression shows up as null tokenizer → empty
+  //    output, which this catches). Without the dev fixture the step falls
+  //    back to the 1 s silence boot probe.
+  const speechB64 = fs.existsSync(SPEECH) ? fs.readFileSync(SPEECH).toString('base64') : '';
+  const assetsDir = path.join(distRoot, 'assets');
+  const asrWorkerName = fs.existsSync(assetsDir)
+    ? (fs.readdirSync(assetsDir).find((f) => /^asrWorker-[\w-]+\.js$/.test(f)) || '')
+    : '';
+  let asr = { ok: false, err: asrWorkerName ? 'spawn failed' : 'asrWorker chunk not found in dist/assets' };
+  if (asrWorkerName) {
+    asr = await win.webContents.executeJavaScript(`(async () => {
+      try {
+        let samples = new Float32Array(16000), sr = 16000;
+        const b64 = ${JSON.stringify(speechB64)};
+        if (b64) {
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const actx = new AudioContext();
+          const buf = await actx.decodeAudioData(bytes.buffer.slice(0));
+          samples = new Float32Array(buf.length);
+          for (let i = 0; i < buf.length; i++) samples[i] = buf.getChannelData(0)[i];
+          sr = buf.sampleRate;
+          await actx.close();
+        }
+        const w = new Worker('app://bundle/assets/${asrWorkerName}', { type: 'module' });
+        const phases = [];
+        const r = await new Promise((resolve) => {
+          const t = setTimeout(() => resolve({ ok: false, err: 'ASR timeout (model load or transcribe)', phases }), 220_000);
+          w.onmessage = (e) => {
+            const m = e.data || {};
+            if (m.type === 'status') phases.push(m.phase);
+            else if (m.type === 'done') {
+              const segs = m.segments || [];
+              const text = segs.map((s) => s.text || '').join(' ').trim();
+              const want = b64 ? segs.length > 0 && text.length > 0 : true;
+              clearTimeout(t);
+              resolve({ ok: want, speech: !!b64, segments: segs.length, sample: text.slice(0, 80), phases });
+            } else if (m.type === 'error') { clearTimeout(t); resolve({ ok: false, err: m.message, phases }); }
+          };
+          w.onerror = (ev) => { clearTimeout(t); resolve({ ok: false, err: 'worker error: ' + (ev.message || 'unknown'), phases }); };
+          w.postMessage({ type: 'transcribe', id: 1, samples, sampleRate: sr });
+        });
+        w.terminate();
+        return r;
+      } catch (e) { return { ok: false, err: String(e) }; }
+    })()`);
+  }
+  console.log('ASR CHECK:', JSON.stringify(asr));
+
   console.log('SMOKE RESULT:', JSON.stringify(res, null, 2));
   console.log('APP VERSION CHECK:', APP_PKG.version, 'title fix:', APP_PKG.version !== '2.2');
-  app.exit(res && res.ok && bridge && bridge.ok ? 0 : 3);
+  app.exit(res && res.ok && bridge && bridge.ok && modelOk && asr.ok ? 0 : 3);
 });

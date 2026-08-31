@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState } from 'react';
+import { pickActiveSegment, wordSpans, activeWordIndex, wrapLine, type SubtitleSegment } from '../lib/subtitles';
 
 interface Props {
   analyser: AnalyserNode | null;
@@ -19,13 +20,26 @@ interface Props {
   creditText?: string | null;
   /** Reports the created (detached) video elements in selection order. */
   onBgVideosReady?: (videos: HTMLVideoElement[]) => void;
+  /** Karaoke/subtitle burn-in (export mode): lines + render style. */
+  karaoke?: { segments: SubtitleSegment[]; style: 'karaoke' | 'subs' } | null;
+  /** Audio clock for the subtitle overlay: seconds from the region start. */
+  karaokeGetTime?: () => number;
 }
 
-export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, width = 800, height = 200, exportMode, metadata, onCanvasReady, coverOffset = { x: 0, y: 0 }, bgVideoUrls, bgCueTimes, bgGetTime, creditText, onBgVideosReady }) => {
+export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, width = 800, height = 200, exportMode, metadata, onCanvasReady, coverOffset = { x: 0, y: 0 }, bgVideoUrls, bgCueTimes, bgGetTime, creditText, onBgVideosReady, karaoke, karaokeGetTime }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const videoElsRef = useRef<HTMLVideoElement[]>([]);
+  // Last decoded frame per bg clip (via requestVideoFrameCallback, which only
+  // fires while a video plays). Drawn as a fallback when the video briefly
+  // drops readyState or regresses across its loop wrap — no black/stale
+  // flash in the exported file.
+  const frameCacheRef = useRef(new Map<HTMLVideoElement, ImageBitmap>());
+  // Previous-frame currentTime per clip (loop-wrap detector).
+  const lastCtRef = useRef(new Map<HTMLVideoElement, number>());
+  // Once-ready clips stay in the rotation forever (stable k % n indices).
+  const everReadyRef = useRef(new WeakMap<HTMLVideoElement, boolean>());
   const [dimensions, setDimensions] = useState({ w: width, h: height });
 
   // Latest bg props for the rAF loop — assigned after every render, read per
@@ -33,6 +47,16 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
   const bgStateRef = useRef<{ urls: string[]; cues: number[]; getTime: (() => number) | null }>({ urls: [], cues: [], getTime: null });
   useEffect(() => {
     bgStateRef.current = { urls: bgVideoUrls ?? [], cues: bgCueTimes ?? [], getTime: bgGetTime ?? null };
+  });
+
+  // Latest karaoke props for the rAF loop (same latest-ref pattern as bg).
+  const karaokeStateRef = useRef<{ segments: SubtitleSegment[]; style: 'karaoke' | 'subs'; getTime: (() => number) | null }>({ segments: [], style: 'karaoke', getTime: null });
+  useEffect(() => {
+    karaokeStateRef.current = {
+      segments: karaoke?.segments ?? [],
+      style: karaoke?.style ?? 'karaoke',
+      getTime: karaokeGetTime ?? null,
+    };
   });
 
   useEffect(() => {
@@ -83,6 +107,9 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
       v.pause();
       v.removeAttribute('src');
       v.load();
+      frameCacheRef.current.get(v)?.close();
+      frameCacheRef.current.delete(v);
+      lastCtRef.current.delete(v);
     });
 
     const urls = bgVideoUrls ?? [];
@@ -100,6 +127,28 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
         els.push(v);
       });
       videoElsRef.current = els;
+      // Cache every decoded frame while the clip plays; the draw loop reads
+      // it whenever the live element would serve a black/stale frame.
+      els.forEach((v) => {
+        const anyV = v as any;
+        if (typeof anyV.requestVideoFrameCallback !== 'function') return;
+        const onFrame = (_now: number, meta: { target: any }) => {
+          const vid = meta.target as HTMLVideoElement;
+          if (!videoElsRef.current.includes(vid)) {
+            frameCacheRef.current.get(vid)?.close();
+            frameCacheRef.current.delete(vid);
+            return;
+          }
+          if (vid.readyState >= 2) {
+            createImageBitmap(vid).then((b) => {
+              frameCacheRef.current.get(vid)?.close();
+              frameCacheRef.current.set(vid, b);
+            }).catch(() => {});
+          }
+          anyV.requestVideoFrameCallback(onFrame);
+        };
+        anyV.requestVideoFrameCallback(onFrame);
+      });
       onBgVideosReady?.(els);
     }
     return () => {
@@ -164,7 +213,16 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
       // the rotation (readyVids), so a slow download degrades the cut count,
       // never the video.
       const bg = bgStateRef.current;
-      const readyVids = videoElsRef.current.filter((v) => v.readyState >= 2 && v.videoWidth > 0 && v.videoHeight > 0);
+      // Stable rotation: a clip that was ever ready stays in the list —
+      // dropping it mid-export would remap every future k % n index and
+      // change all later cuts. Frame gaps are covered by the frame cache.
+      const everReady = everReadyRef.current;
+      const vids = videoElsRef.current;
+      for (let vi = 0; vi < vids.length; vi += 1) {
+        const v = vids[vi];
+        if (!everReady.has(v) && v.readyState >= 2 && v.videoWidth > 0 && v.videoHeight > 0) everReady.set(v, true);
+      }
+      const readyVids = vids.filter((v) => everReady.has(v));
       const bgActive = exportMode && bg.urls.length > 0 && readyVids.length > 0;
       if (bgActive) {
         const tNow = bg.getTime ? bg.getTime() : 0;
@@ -173,23 +231,51 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
         for (let ci = 0; ci < cues.length; ci += 1) {
           if (cues[ci] <= tNow) k += 1; else break;
         }
-        const drawVid = (v: HTMLVideoElement, alpha: number) => {
-          const vScale = Math.max(canvas.width / v.videoWidth, canvas.height / v.videoHeight);
-          const vdw = v.videoWidth * vScale;
-          const vd = v.videoHeight * vScale;
+        const n = readyVids.length;
+        const inFade = cues.length > 0 && k >= 1 && tNow - cues[k - 1] < 0.6;
+        const curV = readyVids[k % n];
+        const prevV = inFade ? readyVids[(k - 1) % n] : null;
+        const nextV = readyVids[(k + 1) % n];
+        // Decoder budget: only the clip on screen (+ its fade-out partner +
+        // the next one, warm for the cut) plays. Four concurrent decoders
+        // starve each other under the export load — frames arrive seconds
+        // late and loop wraps flash. Not-yet-ready clips keep playing so a
+        // slow one can still join the rotation.
+        for (let vi = 0; vi < vids.length; vi += 1) {
+          const v = vids[vi];
+          const wantPlay = !everReady.has(v) || v === curV || v === nextV || v === prevV;
+          if (wantPlay && v.paused) v.play().catch(() => {});
+          else if (!wantPlay && !v.paused) v.pause();
+        }
+        const drawCover = (sw: number, sh: number, img: CanvasImageSource, alpha: number) => {
+          const vScale = Math.max(canvas.width / sw, canvas.height / sh);
+          const vdw = sw * vScale;
+          const vdh = sh * vScale;
           ctx.imageSmoothingEnabled = true;
           ctx.imageSmoothingQuality = 'high';
           if (alpha < 1) ctx.globalAlpha = alpha;
-          ctx.drawImage(v, (canvas.width - vdw) / 2, (canvas.height - vd) / 2, vdw, vd);
+          ctx.drawImage(img, (canvas.width - vdw) / 2, (canvas.height - vdh) / 2, vdw, vdh);
           if (alpha < 1) ctx.globalAlpha = 1;
         };
-        const n = readyVids.length;
-        if (cues.length > 0 && k >= 1 && tNow - cues[k - 1] < 0.6) {
+        const drawVid = (v: HTMLVideoElement, alpha: number) => {
+          const cache = frameCacheRef.current.get(v);
+          const prevCt = lastCtRef.current.get(v);
+          const wrapped = prevCt !== undefined && v.currentTime < prevCt - 0.01;
+          lastCtRef.current.set(v, v.currentTime);
+          if (v.videoWidth > 0 && !wrapped && v.readyState >= 2) {
+            drawCover(v.videoWidth, v.videoHeight, v, alpha);
+          } else if (cache) {
+            drawCover(cache.width, cache.height, cache, alpha);
+          } else if (v.videoWidth > 0) {
+            drawCover(v.videoWidth, v.videoHeight, v, alpha);
+          }
+        };
+        if (inFade) {
           const alpha = (tNow - cues[k - 1]) / 0.6;
-          drawVid(readyVids[(k - 1) % n], 1);
-          drawVid(readyVids[k % n], alpha);
+          drawVid(prevV!, 1);
+          drawVid(curV, alpha);
         } else {
-          drawVid(readyVids[k % n], 1);
+          drawVid(curV, 1);
         }
       }
 
@@ -624,6 +710,78 @@ export const AudioVisualizer: React.FC<Props> = ({ analyser, mode, coverArt, wid
           ctx.textAlign = 'right';
           ctx.textBaseline = 'bottom';
           ctx.fillText(creditText, canvas.width - creditMargin, canvas.height - creditMargin);
+        }
+
+        // Karaoke / subtitle burn-in (v2.6) — drawn LAST so it sits above the
+        // background clips, the cover frame and the credit line. Region clock
+        // = karaokeGetTime (same seam as the Pexels cue math).
+        {
+          const ks = karaokeStateRef.current;
+          if (ks.segments.length > 0) {
+            const kt = ks.getTime ? ks.getTime() : 0;
+            const seg = pickActiveSegment(ks.segments, kt);
+            if (seg) {
+              const fs = Math.max(canvas.height * 0.026, 26);
+              const margin = Math.max(canvas.height * 0.05, 44);
+              ctx.save();
+              ctx.font = `bold ${fs}px sans-serif`;
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'alphabetic';
+              ctx.lineJoin = 'round';
+              ctx.miterLimit = 2;
+              const stroke = (txt: string, x: number, y: number) => {
+                ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+                ctx.lineWidth = fs * 0.18;
+                ctx.strokeText(txt, x, y);
+              };
+              if (ks.style === 'subs') {
+                const lines = wrapLine(seg.text);
+                const startY = canvas.height - margin - (lines.length - 1) * fs * 1.3;
+                lines.forEach((ln, i) => {
+                  const y = startY + i * fs * 1.3;
+                  stroke(ln, canvas.width / 2, y);
+                  ctx.fillStyle = '#ffffff';
+                  ctx.fillText(ln, canvas.width / 2, y);
+                });
+              } else {
+                // Karaoke: one word at a time in the accent color, the rest
+                // dimmed. Words come from wrapLine (≤2 lines) so per-word
+                // indices stay aligned with activeWordIndex's word numbering —
+                // wrapLine preserves word order across its lines.
+                const activeIdx = activeWordIndex(seg, kt);
+                const gap = ctx.measureText(' ').width;
+                const maxW = canvas.width * 0.9;
+                const words: { text: string; idx: number }[] = [];
+                let wi = 0;
+                for (const ln of wrapLine(seg.text)) {
+                  for (const w of ln.split(/\s+/).filter(Boolean)) words.push({ text: w, idx: wi++ });
+                }
+                const linesW: { w: { text: string; idx: number }; width: number }[][] = [[]];
+                let rowW = 0;
+                for (const w of words) {
+                  const ww = ctx.measureText(w.text).width;
+                  if (rowW > 0 && rowW + gap + ww > maxW) { linesW.push([]); rowW = 0; }
+                  else if (rowW > 0) rowW += gap;
+                  linesW[linesW.length - 1].push({ w, width: ww });
+                  rowW += ww;
+                }
+                const startY = canvas.height - margin - (linesW.length - 1) * fs * 1.3;
+                ctx.textAlign = 'left';
+                linesW.forEach((row, li) => {
+                  const total = row.reduce((a, it) => a + it.width, 0) + gap * (row.length - 1);
+                  let x = (canvas.width - total) / 2;
+                  const y = startY + li * fs * 1.3;
+                  for (const it of row) {
+                    stroke(it.w.text, x, y);
+                    ctx.fillStyle = it.w.idx === activeIdx ? '#00ffd2' : 'rgba(255, 255, 255, 0.6)';
+                    ctx.fillText(it.w.text, x, y);
+                    x += it.width + gap;
+                  }
+                });
+              }
+              ctx.restore();
+            }
+          }
         }
       }
 

@@ -37,6 +37,8 @@ import { LiteMaster } from './components/LiteMaster';
 import { getAutoMasterSettings } from './services/geminiService';
 import { searchPexelsVideos, pickBestRendition, ensureClipBlob, PexelsApiError, MAX_PEXELS_CLIPS, hasPexelsKey, setPexelsKey } from './services/pexelsService';
 import { findPeakCuePoints } from './lib/audioMeters';
+import { recognizeLyrics } from './lib/asrClient';
+import { segmentsToSrt, type SubtitleSegment } from './lib/subtitles';
 import { loadLlmConfig, saveLlmConfig, llmAutoMaster, llmAiReport, LlmConfig, LlmError } from './services/llmService';
 import { LlmSettingsModal } from './components/LlmSettingsModal';
 import { clsx, type ClassValue } from 'clsx';
@@ -555,6 +557,8 @@ export default function App() {
   // export runs (see isExportingVideo below), so handleExport — an async
   // closure over one render — must read the nodes through refs, not stale state.
   const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // M4.5b: last Pexels cue-computation inputs (diagnostics for the e2e only).
+  const exportDiagRef = useRef<Record<string, unknown> | null>(null);
   const [isExportingVideo, setIsExportingVideo] = useState(false);
   // Cut-point times (seconds from export start) for the multi-clip Pexels
   // background — set by handleExport right before the export canvas mounts.
@@ -562,8 +566,23 @@ export default function App() {
   // Ref mirror for the DEV hook (the hook closure is created once in a
   // mount-only effect, so it can only read refs, not render-fresh state).
   const exportBgCuesRef = useRef<number[]>([]);
+  // DEV-only cue injection (e2e M4.5b): when set, handleExport uses these cues
+  // instead of findPeakCuePoints — the flicker-regress tests frame fidelity,
+  // not peak detection (covered by M4.5), and must be independent of the
+  // mastering state earlier e2e sections may have left behind.
+  const pexelsTestCuesRef = useRef<number[] | null>(null);
   // Audio clock for the cue math: track position minus the export start.
   const pexelsBgGetTime = () => Math.max(0, (audioEngine.current?.getCurrentTime() ?? 0) - exportStartRef.current);
+
+  // Karaoke subtitles (v2.6): offline Whisper ASR over the export region.
+  // Segment timings are seconds from the REGION START — the same clock as
+  // pexelsBgGetTime, so the burn-in overlay and the SRT share one seam.
+  const [karaokeOn, setKaraokeOn] = useState(false);
+  const [asrState, setAsrState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [asrPhase, setAsrPhase] = useState<'loading' | 'loading-wasm' | 'transcribing'>('loading');
+  const [asrError, setAsrError] = useState<string | null>(null);
+  const [karaokeLines, setKaraokeLines] = useState<SubtitleSegment[] | null>(null);
+  const [karaokeStyle, setKaraokeStyle] = useState<'karaoke' | 'subs'>('karaoke');
 
   // Pexels stock-video background states. Multi-clip: up to MAX_PEXELS_CLIPS
   // clips, rotation order = selection order (badge #1..#N in the UI).
@@ -630,6 +649,36 @@ export default function App() {
         getNeutralSettings: () => ({ ...NEUTRAL_SETTINGS }),
         // M4.5: live cut-point cues of the in-flight (or last) video export.
         getExportBgCues: () => exportBgCuesRef.current,
+        // M4.5b diagnostics: bg mode (from the DOM — the seam closure can be
+        // stale), selection statuses / cues (refs — always live).
+        getPexelsDebug: () => ({
+          mode: (() => {
+            const r = [...document.querySelectorAll<HTMLInputElement>('input[type="radio"][name="videoBgMode"]')]
+              .find((x) => x.checked);
+            return r ? ((r.closest('label') || r.parentElement)?.textContent || '?').trim() : 'none-checked';
+          })(),
+          statuses: pexelsSelectionRef.current.map((s) => s.status),
+          cues: exportBgCuesRef.current,
+          exporting: !!exportCanvasRef.current,
+          diag: exportDiagRef.current,
+        }),
+        // flicker probe (scripts/e2e-flicker.cjs): the detached bg <video>
+        // elements of the mounted export canvas (readyState/currentTime).
+        getBgVideos: () => bgVideosRef.current,
+        // M1.14 (karaoke burn-in): inject subtitle lines WITHOUT running the
+        // ASR model (timings in seconds from region start). null/[] clears.
+        setKaraokeTestLines: (lines: Array<{ start: number; end: number; text: string }> | null) => {
+          if (lines && lines.length) {
+            setKaraokeLines(lines.map((l) => ({ start: l.start, end: l.end, text: l.text })));
+            setKaraokeOn(true);
+            setAsrState('done');
+          } else {
+            setKaraokeLines(null);
+            setKaraokeOn(false);
+            setAsrState('idle');
+          }
+          return true;
+        },
         resetCoverOffset: () => { setCoverOffset({ x: 0, y: 0 }); return true; },
         // M4.5 (multi-clip Pexels export): injects fake "ready" selection
         // items pointing at in-page object URLs (synthetic webm clips), so
@@ -651,6 +700,13 @@ export default function App() {
             };
           });
           setPexelsSelection(sel);
+          return true;
+        },
+        // M4.5b (flicker regress): pin the cue list so the export's clip
+        // rotation is deterministic regardless of the rendered master's
+        // peak content. null restores peak detection.
+        setPexelsTestCues: (cues: number[] | null) => {
+          pexelsTestCuesRef.current = Array.isArray(cues) && cues.length > 0 ? cues.slice() : null;
           return true;
         },
       };
@@ -1141,8 +1197,43 @@ export default function App() {
     }
   };
 
+  // Whisper ASR over the export region (offline, in a module worker). The
+  // region PCM is rendered exactly like the cue pass — same input, same
+  // timing seam. Music ASR is imperfect by nature; the UI lets the user fix
+  // every line before export.
+  const handleRecognizeLyrics = async () => {
+    if (!track || !audioEngine.current) return;
+    setAsrState('running');
+    setAsrError(null);
+    setAsrPhase('loading');
+    try {
+      const pcm = await audioEngine.current.renderProPcm(
+        settings, Number(trimStart) || 0, Number(trimEnd) || 0, effectRegions
+      );
+      if (!pcm) throw new Error('render failed');
+      const n = Math.min(pcm.left.length, pcm.right.length);
+      const mono = new Float32Array(n);
+      for (let i = 0; i < n; i += 1) mono[i] = (pcm.left[i] + pcm.right[i]) * 0.5;
+      const segs = await recognizeLyrics(mono, pcm.sampleRate, (s) => setAsrPhase(s.phase));
+      if (!segs.length) {
+        setAsrState('error');
+        setAsrError((t as any).asrNoLyrics || 'No lyrics detected in this region');
+        return;
+      }
+      setKaraokeLines(segs);
+      setAsrState('done');
+    } catch (e) {
+      setAsrState('error');
+      setAsrError(`ASR: ${(e as Error).message}`);
+    }
+  };
+
   const handleExport = async () => {
     if (!track || !audioEngine.current || (!exportAudio && !exportVideo)) return;
+    if (exportVideo && karaokeOn && !karaokeLines) {
+      showToast((t as any).needLines || 'Recognize lyrics before exporting with subtitles', 'warn');
+      return;
+    }
     setIsProcessing(true);
 
     try {
@@ -1186,7 +1277,9 @@ export default function App() {
           ? pexelsSelectionRef.current.filter((s) => s.status === 'ready' && s.url)
           : [];
         let bgCues: number[] = [];
-        if (readySel.length >= 2) {
+        if (pexelsTestCuesRef.current) {
+          bgCues = pexelsTestCuesRef.current; // e2e M4.5b pinned cues
+        } else if (readySel.length >= 2) {
           const pcm = masterPcm ?? await audioEngine.current.renderProPcm(
             settings, Number(trimStart) || 0, Number(trimEnd) || 0, effectRegions
           );
@@ -1195,6 +1288,19 @@ export default function App() {
             bgCues = findPeakCuePoints(pcm.left, pcm.right, pcm.sampleRate, 0, regionSec);
           }
         }
+        // M4.5b diagnostics (scripts/e2e-flicker-regress.cjs): why bgCues came
+        // out the way it did — surfaces readySel/pcm/trim state at click time.
+        // expT: wall/engine timing of the capture pipeline — the full suite
+        // lost the first ~1.9 s of the region in the FILE while the canvas
+        // painted it perfectly; these markers pinpoint where.
+        const expT: Record<string, number> = {};
+        const engNow = () => Math.round((audioEngine.current?.getCurrentTime() ?? 0) * 100) / 100;
+        exportDiagRef.current = {
+          isPexelsBg, readySel: readySel.length, statuses: pexelsSelectionRef.current.map((s) => s.status),
+          exportAudio, trimStart: Number(trimStart) || 0, trimEnd: Number(trimEnd) || 0,
+          recLenSec, masterPcm: !!masterPcm, pcmOk: bgCues.length > 0, cues: bgCues.length,
+          seam: !!pexelsTestCuesRef.current, t: expT
+        };
         setExportBgCues(bgCues);
         exportBgCuesRef.current = bgCues;
         exportStartRef.current = recStart;
@@ -1202,6 +1308,11 @@ export default function App() {
         // Mount the hidden high-res canvas only for the duration of the export.
         // It was always-mounted before: up to a 2160×3840 canvas drawing every
         // frame during normal playback (the visualizer rendered twice).
+        // Drop the PREVIOUS export's canvas first — onCanvasReady only sets the
+        // ref, and if the stale (detached, un-drawn) element were still in it,
+        // the poll below would return immediately and captureStream would
+        // record the dead canvas (black frames although the live canvas paints).
+        exportCanvasRef.current = null;
         setIsExportingVideo(true);
         await new Promise<void>((resolve) => {
           const t0 = Date.now();
@@ -1215,7 +1326,9 @@ export default function App() {
           setIsExportingVideo(false);
           throw new Error('Export canvas failed to mount');
         }
-        const exportCanvas = exportCanvasRef.current;
+        // `as` is needed: the ref-reset above makes TS narrow .current to null,
+        // the poll + onCanvasReady refill are invisible to control-flow typing.
+        const exportCanvas = exportCanvasRef.current as HTMLCanvasElement;
 
         // Pexels backgrounds: wait for first frames (up to 8 s) BEFORE the
         // audio starts — otherwise the clips and the track desync. The
@@ -1246,9 +1359,14 @@ export default function App() {
         }
 
         audioEngine.current.seek(recStart);
-        // The context must be fully running before captureStream/record
-        await audioEngine.current.play();
-        setIsPlaying(true);
+        // The context must be fully running before captureStream/record — but
+        // the RESUME alone must not sit between play and recorder.start: under
+        // load it can block for seconds, and everything the engine plays in
+        // that window never reaches the file (export starts 2 s late). Warm
+        // the context here (no source started yet), start the recorder, and
+        // only then start playback.
+        await audioEngine.current.getAudioContext().resume();
+        expT.tResume = Date.now(); expT.eResume = engNow();
 
         const dest = audioEngine.current.getAudioContext().createMediaStreamDestination();
         audioEngine.current.getMonitorGain().connect(dest);
@@ -1284,8 +1402,14 @@ export default function App() {
         bps = baseM * pM * 1024 * 1024;
 
         const recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: bps });
+        expT.tRec = Date.now(); expT.eRec = engNow();
         const chunks: BlobPart[] = [];
-        recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+        recorder.ondataavailable = e => {
+          if (e.data.size) {
+            if (!expT.tData) { expT.tData = Date.now(); expT.eData = engNow(); expT.nData = e.data.size; }
+            chunks.push(e.data);
+          }
+        };
         
         const videoPromise = new Promise<void>((resolve, reject) => {
           let reqId: number;
@@ -1305,6 +1429,7 @@ export default function App() {
             if (reqId) cancelAnimationFrame(reqId);
             try {
               const blob = new Blob(chunks, { type: mimeType.split(';')[0] });
+              expT.tStopDone = Date.now(); expT.blobSize = blob.size;
               const url = URL.createObjectURL(blob);
               const a = document.createElement('a');
               a.style.display = 'none';
@@ -1322,15 +1447,35 @@ export default function App() {
           };
           recorder.onerror = (e) => {
              if (reqId) cancelAnimationFrame(reqId);
-             reject(e);
+             // e is a raw ErrorEvent — rejecting with it made the failure an
+             // undiagnosable "[object ErrorEvent]" in the console. e.error is
+             // the underlying DOMException.
+             reject((e as ErrorEvent).error ?? new Error('MediaRecorder error'));
           };
         });
 
         recorder.start(100); // 100ms chunks to stop 4K freezing and OOM!
+        expT.tStart = Date.now(); expT.eStart = engNow();
+
+        // Playback starts AFTER the recorder is live: whatever the source
+        // start costs (context already resumed above), no region content can
+        // be lost between play and start. A possible short pre-roll shows as
+        // moving clip frames (bg videos already play), never as black/freeze.
+        try {
+          await audioEngine.current.play();
+        } catch (e) {
+          try { recorder.stop(); } catch { /* already inactive */ }
+          videoStream.getTracks().forEach((tr) => tr.stop());
+          dest.stream.getTracks().forEach((tr) => tr.stop());
+          throw e;
+        }
+        setIsPlaying(true);
+        expT.tPlay = Date.now(); expT.ePlay = engNow();
 
         const ms = recLenSec * 1000;
         await new Promise(r => setTimeout(r, ms + 100)); // wait for the trimmed region to play
 
+        expT.tStop = Date.now(); expT.eStop = engNow(); expT.chunks = chunks.length;
         recorder.stop();
         bgVideosRef.current.forEach((v) => v.pause());
         // With trimEnd < track end the source is still playing — stop it and
@@ -1339,8 +1484,22 @@ export default function App() {
         audioEngine.current.getMonitorGain().disconnect(dest);
         audioEngine.current.setBypass(savedBypass);
         setIsPlaying(false);
-        await videoPromise;
+        // Release the capture: canvas tracks left "live" keep requesting
+        // frames from the unmounted export canvas forever and break the
+        // canvas-capture pipeline of the NEXT export (black frames recorded
+        // although the canvas paints correctly) — plus leak encoders.
+        await videoPromise.finally(() => {
+          videoStream.getTracks().forEach((tr) => tr.stop());
+          dest.stream.getTracks().forEach((tr) => tr.stop());
+        });
         setIsExportingVideo(false);
+        // Karaoke: the .srt lands right after the video (same base name).
+        if (karaokeOn && karaokeLines) {
+          downloadBlob(
+            new Blob([segmentsToSrt(karaokeLines)], { type: 'text/plain;charset=utf-8' }),
+            `${fileNameBase}_NeuralMaster.srt`
+          );
+        }
       }
 
       setShowDone(true);
@@ -1381,6 +1540,8 @@ export default function App() {
               ? `${(t as any).videoAuthor || 'Video:'} Pexels / ${pexelsCreditNames.join(', ')}`
               : null}
             onBgVideosReady={(vs) => { bgVideosRef.current = vs; }}
+            karaoke={karaokeOn && karaokeLines ? { segments: karaokeLines, style: karaokeStyle } : null}
+            karaokeGetTime={pexelsBgGetTime}
           />
         </div>
       )}
@@ -2775,15 +2936,100 @@ export default function App() {
                         )}
                       </div>
                     )}
+                    {/* Karaoke subtitles — offline Whisper ASR (v2.6). Works with
+                        either background mode; burn-in + .srt share one region clock. */}
+                    <div className="pt-2 border-t border-[var(--border)]">
+                      <label className="flex items-center gap-1.5 text-[11px] font-bold text-white cursor-pointer">
+                        <input type="checkbox" checked={karaokeOn} onChange={(e) => setKaraokeOn(e.target.checked)} className="accent-[var(--accent)]" />
+                        {(t as any).karaokeOn || 'Karaoke subtitles'}
+                      </label>
+                      {karaokeOn && (
+                        <div className="mt-2 space-y-2">
+                          <button
+                            onClick={handleRecognizeLyrics}
+                            disabled={asrState === 'running' || !track}
+                            className="w-full bg-[var(--accent)] text-black rounded-sm py-2 text-[11px] font-bold disabled:opacity-40"
+                          >
+                            {asrState === 'running'
+                              ? (asrPhase === 'transcribing'
+                                ? ((t as any).asrTranscribing || 'Transcribing…')
+                                : asrPhase === 'loading-wasm'
+                                  ? ((t as any).asrLoadingWasm || 'Loading engine…')
+                                  : ((t as any).asrLoading || 'Loading model…'))
+                              : (karaokeLines
+                                ? ((t as any).asrRecognizeAgain || 'Recognize again')
+                                : ((t as any).asrRecognize || 'Recognize lyrics'))}
+                          </button>
+                          <p className="text-[9px] font-mono text-[var(--text-dim)]">
+                            {(t as any).asrSlow || 'Fully offline — on CPU this can take a minute'}
+                          </p>
+                          {asrState === 'error' && (
+                            <div className="flex items-center gap-2">
+                              <p className="flex-1 min-w-0 truncate text-[10px] text-red-400 font-mono">{asrError}</p>
+                              <button onClick={handleRecognizeLyrics} className="shrink-0 text-[10px] font-mono text-[var(--accent)] underline">
+                                {(t as any).asrRetry || 'Retry'}
+                              </button>
+                            </div>
+                          )}
+                          {karaokeLines && (
+                            <div className="space-y-1.5">
+                              <div className="flex gap-1.5">
+                                {(['karaoke', 'subs'] as const).map((st) => (
+                                  <label key={st} className={`flex-1 bg-black border rounded-sm px-2 py-2 text-[11px] cursor-pointer ${karaokeStyle === st ? 'border-[var(--accent)]' : 'border-[var(--border)]'}`}>
+                                    <input type="radio" name="karaokeStyle" className="accent-[var(--accent)] mr-1.5" checked={karaokeStyle === st} onChange={() => setKaraokeStyle(st)} />
+                                    {st === 'karaoke' ? ((t as any).styleKaraoke || 'Karaoke') : ((t as any).styleSubs || 'Subtitles')}
+                                  </label>
+                                ))}
+                              </div>
+                              <div className="max-h-[180px] overflow-y-auto space-y-1 pr-1">
+                                {karaokeLines.map((seg, i) => (
+                                  <div key={i} className="flex items-center gap-1.5">
+                                    <span className="shrink-0 w-[86px] text-[8px] font-mono text-[var(--text-dim)]">
+                                      {seg.start.toFixed(1)}–{seg.end.toFixed(1)}s
+                                    </span>
+                                    <input
+                                      type="text"
+                                      value={seg.text}
+                                      onChange={(e) => setKaraokeLines((karaokeLines || []).map((s, j) => (j === i ? { ...s, text: e.target.value } : s)))}
+                                      className="flex-1 min-w-0 bg-black border border-[var(--border)] rounded-sm px-1.5 py-1 text-[10px] focus:outline-none"
+                                    />
+                                    <button
+                                      onClick={() => setKaraokeLines((karaokeLines || []).filter((_, j) => j !== i))}
+                                      className="shrink-0 text-[10px] text-[var(--text-dim)] hover:text-red-400"
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                              <p className="text-[9px] font-mono text-[var(--text-dim)]">
+                                {(t as any).linesHint || 'Edit the text before export — ASR on music is imperfect'}
+                              </p>
+                              <button
+                                onClick={() => downloadBlob(new Blob([segmentsToSrt(karaokeLines)], { type: 'text/plain;charset=utf-8' }), `${metadata.title || 'master'}_NeuralMaster.srt`)}
+                                className="w-full bg-black border border-[var(--border)] rounded-sm py-2 text-[11px] hover:border-[var(--accent)]"
+                              >
+                                {(t as any).srtBtn || 'Download .srt'}
+                              </button>
+                            </div>
+                          )}
+                          {!karaokeLines && asrState !== 'running' && (
+                            <p className="text-[10px] text-yellow-400 font-mono">
+                              {(t as any).needLines || 'Recognize lyrics before exporting with subtitles'}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}
             </div>
           </div>
 
-          <button 
+          <button
             onClick={handleExport}
-            disabled={!track || isProcessing || (exportAudio && exportFormat === 'aac' && aacState !== 'ready') || (!exportAudio && !exportVideo)}
+            disabled={!track || isProcessing || (exportAudio && exportFormat === 'aac' && aacState !== 'ready') || (!exportAudio && !exportVideo) || (exportVideo && karaokeOn && !karaokeLines)}
             className="btn-primary mt-auto flex flex-col items-center justify-center py-3"
           >
             <span>{isExportingVideo ? (t.recordingVideo || "Recording Video...") : isProcessing ? t.exporting : t.export}</span>

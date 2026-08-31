@@ -10,6 +10,10 @@ release/
 public/faust/
 public/ffmpeg/
 
+# Bundled Whisper ASR model — fetched by scripts/fetch-whisper-model.mjs
+# (npm run fetch:models) before build:exe; ~78 MB, never committed.
+public/models/
+
 # Local tooling / session state
 .codegraph/
 .claude/
@@ -50,6 +54,10 @@ docs/screenshots/tone_test.wav
 docs/screenshots/e2e_*.wav
 docs/screenshots/e2e_cover_wide.png
 docs/screenshots/fps_tone.wav
+# flicker-regress diagnostics (probe output + full-suite export dump)
+docs/screenshots/flicker_probe.json
+docs/screenshots/full_m45b_*
+docs/screenshots/repro_*
 test-api.mjs
 test_getparams.mjs
 

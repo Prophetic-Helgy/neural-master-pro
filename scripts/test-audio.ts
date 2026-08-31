@@ -31,6 +31,15 @@ import { encodeAudio } from '../src/lib/exportEncoders.ts';
 import { buildAacArgs } from '../src/lib/aacEncoder.ts';
 import { applyChangedParams, PARAM_EPS } from '../src/lib/paramDiff.ts';
 import { alignVocal } from '../src/lib/audioAlign.ts';
+import {
+  activeWordIndex,
+  groupWordsIntoSegments,
+  pickActiveSegment,
+  segmentsToSrt,
+  srtTime,
+  wordSpans,
+  wrapLine,
+} from '../src/lib/subtitles.ts';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -1107,6 +1116,93 @@ function t24(): void {
 }
 
 // ---------------------------------------------------------------------------
+/**
+ * t28 — subtitles.ts: SRT format, line wrap, karaoke word interpolation,
+ * active-segment/word selection, and Whisper word grouping. All pure math.
+ */
+function t28(): void {
+  console.log('\nT28. Karaoke/subtitle line math (subtitles.ts)');
+
+  // (a) srtTime formatting
+  check('srtTime zero', srtTime(0) === '00:00:00,000', srtTime(0));
+  check('srtTime 1h1m1.5s', srtTime(3661.5) === '01:01:01,500', srtTime(3661.5));
+  check('srtTime negative clamps', srtTime(-2) === '00:00:00,000', srtTime(-2));
+  check('srtTime ms rounding', srtTime(1.2345) === '00:00:01,235' || srtTime(1.2345) === '00:00:01,234', srtTime(1.2345));
+
+  // (b) segmentsToSrt: numbering, arrow, blank line, wrap, trailing newline
+  {
+    const srt = segmentsToSrt([
+      { start: 0, end: 2, text: 'hello world' },
+      { start: 3, end: 5.5, text: 'x'.repeat(20) + ' ' + 'x'.repeat(30) },
+    ]);
+    check('srt starts with "1\\n"', srt.startsWith('1\n'), srt.slice(0, 30).replace(/\n/g, '\\n'));
+    check('srt arrow format', srt.includes('00:00:00,000 --> 00:00:02,000'), '');
+    check('srt separates entries', srt.includes('\n\n2\n'), '');
+    check('srt wraps long text', srt.includes('\n' + 'x'.repeat(20) + '\n' + 'x'.repeat(30) + '\n'), '');
+    check('srt trailing newline', srt.endsWith('\n'), '');
+  }
+
+  // (c) pickActiveSegment: inclusive ends, gaps
+  {
+    const segs = [{ start: 1, end: 2, text: 'a' }, { start: 3, end: 4, text: 'b' }];
+    check('pick before first -> null', pickActiveSegment(segs, 0.5) === null, '');
+    check('pick inside', pickActiveSegment(segs, 1.5)?.text === 'a', '');
+    check('pick at end inclusive', pickActiveSegment(segs, 2)?.text === 'a', '');
+    check('pick in gap -> null', pickActiveSegment(segs, 2.5) === null, '');
+    check('pick last at end', pickActiveSegment(segs, 4)?.text === 'b', '');
+  }
+
+  // (d) wordSpans interpolation ∝ char length, passthrough when words present
+  {
+    const spans = wordSpans({ start: 0, end: 2, text: 'Hi there' }); // 2+5=7 chars
+    check('interp spans count', spans.length === 2, `${spans.length}`);
+    check('interp "Hi" share 2/7', near(spans[0].end, 2 * (2 / 7), 1e-9), `${spans[0].end}`);
+    check('interp "there" ends 10/7', near(spans[1].end, 2 * (7 / 7), 1e-9), `${spans[1].end}`);
+    check('interp contiguous', near(spans[0].end, spans[1].start, 1e-9), '');
+    const real = [{ text: 'go', start: 0.1, end: 0.4 }];
+    check('words passthrough', wordSpans({ start: 0, end: 1, text: 'whatever', words: real }) === real, '');
+    check('empty text -> no spans', wordSpans({ start: 0, end: 1, text: '   ' }).length === 0, '');
+  }
+
+  // (e) activeWordIndex incl. last-word boundary tolerance
+  {
+    const seg = { start: 0, end: 2, text: 'Hi there' };
+    check('word idx at 0.1', activeWordIndex(seg, 0.1) === 0, '');
+    check('word idx at 1.0', activeWordIndex(seg, 1.0) === 1, '');
+    check('word idx before seg', activeWordIndex(seg, -0.5) === -1, '');
+    check('word idx after seg', activeWordIndex(seg, 3) === -1, '');
+    check('last word lit at seg end', activeWordIndex(seg, 2) === 1, '');
+  }
+
+  // (f) wrapLine
+  check('wrap short -> 1 line', JSON.stringify(wrapLine('one two')) === '["one two"]', '');
+  check('wrap default 42 fits', wrapLine('a'.repeat(20) + ' ' + 'b'.repeat(21)).length === 1, '');
+  check('wrap over 42 breaks', wrapLine('a'.repeat(20) + ' ' + 'b'.repeat(23)).length === 2, '');
+  {
+    const lines = wrapLine('aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd', 22); // 10x4 words
+    check('wrap -> 2 lines', lines.length === 2, JSON.stringify(lines));
+    check('wrap line lengths', lines[0] === 'aaaaaaaaaa bbbbbbbbbb' && lines[1] === 'cccccccccc dddddddddd', JSON.stringify(lines));
+    const three = wrapLine('aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff', 22);
+    check('wrap caps at 2 lines', three.length === 2, JSON.stringify(three));
+    check('wrap long single word kept', wrapLine('x'.repeat(60)).length === 1, '');
+    check('wrap empty -> []', wrapLine('   ').length === 0, '');
+  }
+
+  // (g) groupWordsIntoSegments: gap break, length break, null skip, words kept
+  {
+    const mk = (t: Array<[string, number, number]>) => t.map(([text, start, end]) => ({ text, start, end }));
+    const gapSegs = groupWordsIntoSegments(mk([['a', 0, 0.3], ['b', 0.3, 0.6], ['c', 1.8, 2.1]]));
+    check('gap > 0.9 splits', gapSegs.length === 2 && gapSegs[1].text === 'c', JSON.stringify(gapSegs.map((s) => s.text)));
+    const lenSegs = groupWordsIntoSegments(mk(Array.from({ length: 12 }, (_, i) => [`word${i}`, i * 0.3, i * 0.3 + 0.25] as [string, number, number])));
+    check('long run splits', lenSegs.length >= 2 && lenSegs.every((s) => s.text.length <= 47), JSON.stringify(lenSegs.map((s) => s.text.length)));
+    const nullSegs = groupWordsIntoSegments([{ text: 'x', start: null, end: null }, { text: 'y', start: 0, end: 1 }]);
+    check('null timings skipped', nullSegs.length === 1 && nullSegs[0].text === 'y', '');
+    check('segment words preserved', !!gapSegs[0].words && gapSegs[0].words!.length === 2, '');
+    check('segment timing = first/last word', gapSegs[0].start === 0 && gapSegs[0].end === 0.6, '');
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
   console.log('Neural Master Pro — audio core known-value tests');
@@ -1143,6 +1239,7 @@ async function main(): Promise<void> {
   t23();
   t24();
   t27();
+  t28();
   t25();
 
   console.log(`\n${'='.repeat(60)}`);

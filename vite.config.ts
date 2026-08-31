@@ -21,6 +21,13 @@ export default defineConfig({
     tailwindcss(),
     cspDev,
   ],
+  // ASR worker (asrWorker.ts) bundles @huggingface/transformers, whose
+  // onnxruntime-web entry code-splits; the default "iife" worker format
+  // rejects code-splitting builds. ES + { type: 'module' } (as spawned in
+  // asrClient.ts) works in Chromium/Electron, also under file://.
+  worker: {
+    format: 'es' as const,
+  },
   build: {
     minify: false, // Fixes "Qe is not defined" and AudioWorklet errors with Faust in prod
     rollupOptions: {

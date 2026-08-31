@@ -35,6 +35,8 @@
  * bitrate, FLAC STREAMINFO, m4a ftyp + title bytes, webm EBML Duration,
  * fflate ZIP -> per-file WAVs.
  */
+const { runFlickerRegress } = require('./e2e-flicker-regress.cjs');
+const { runKaraokeRegress } = require('./e2e-karaoke-regress.cjs');
 const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
@@ -64,8 +66,11 @@ function check(name, cond, detail = '') {
     console.log(`  FAIL  ${name}  ${detail}`);
   }
 }
+let curSection = 'startup';
+const RUN_T0 = Date.now();
 function section(title) {
-  console.log(`\n${'='.repeat(64)}\n${title}\n${'='.repeat(64)}`);
+  curSection = title.split(' — ')[0];
+  console.log(`\n${'='.repeat(64)}\n[+${((Date.now() - RUN_T0) / 1000).toFixed(0)}s] ${title}\n${'='.repeat(64)}`);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -466,6 +471,14 @@ async function awaitDownload(page, ms = 120000) {
   return ok ? takeDownload(page) : null;
 }
 
+/** Flush downloads left in-flight by a previous section so this section's
+ *  awaitDownload cannot consume a stale artifact (run 9: M1.13 consumed a
+ *  late .m4a, M4.5 consumed a late mp4 of its own PREVIOUS section). */
+async function drainDownloads(page, note = '') {
+  for (let d = await awaitDownload(page, 1200); d; d = await awaitDownload(page, 1200))
+    console.log(`    [drain] dropped stale download: ${d.name || '?'} (${d.buf.length} B)${note}`);
+}
+
 // ---------------------------------------------------------------------------
 
 (async () => {
@@ -502,16 +515,76 @@ async function awaitDownload(page, ms = 120000) {
     defaultViewport: { width: 1440, height: 900 },
   });
   const page = await browser.newPage();
+  // Media/resource error attribution: bare 'pageerror: ErrorEvent' carries no
+  // message — capture the element tag + src so failures are locatable.
+  await page.evaluateOnNewDocument(() => {
+    window.__nmpErr = [];
+    window.addEventListener('error', (ev) => {
+      const t = ev.target;
+      window.__nmpErr.push({
+        tag: t && t.tagName ? t.tagName : String(ev.message || 'window'),
+        src: t && (t.currentSrc || t.src) ? String(t.currentSrc || t.src).slice(0, 90) : undefined,
+        code: t && t.error ? t.error.code : undefined,
+        msg: String(ev.message || '').slice(0, 200),
+        stack: ev.error && ev.error.stack ? String(ev.error.stack).slice(0, 400)
+          : (ev.error ? String(ev.error).slice(0, 300) : undefined),
+        // a thrown/rejected ErrorEvent carries the real cause in .error
+        inner: ev.error && ev.error.error
+          ? String(ev.error.error) + ' :: ' + String(ev.error.error.message || '')
+          : undefined,
+        // the thrown ErrorEvent's OWN fields (worker errors: message/filename
+        // describe the failure INSIDE the worker)
+        thrown: ev.error && (ev.error.message || ev.error.filename)
+          ? String(ev.error.message || '') + ' @ ' + String(ev.error.filename || '') + ':' + (ev.error.lineno || 0)
+          : undefined,
+        ctor: t && Object.getPrototypeOf(t) && Object.getPrototypeOf(t).constructor
+          ? Object.getPrototypeOf(t).constructor.name : undefined,
+        // the last resort for the blob-hash ErrorEvent: what IS the thrown thing
+        errCtor: ev.error && ev.error.constructor ? ev.error.constructor.name : typeof ev.error,
+        errName: ev.error && ev.error.name,
+        errString: typeof ev.error === 'object' && ev.error ? String(ev.error).slice(0, 160) : String(ev.error).slice(0, 160),
+        errProps: ev.error && typeof ev.error === 'object'
+          ? Object.getOwnPropertyNames(ev.error).join(',').slice(0, 160) : undefined,
+        href: location.href.slice(0, 42),
+        ageMs: Math.round(performance.now()),
+      });
+    }, true);
+    window.addEventListener('unhandledrejection', (ev) => {
+      const r = ev.reason;
+      window.__nmpErr.push({
+        tag: 'unhandledrejection',
+        msg: String((r && r.message) || r).slice(0, 200),
+        inner: r && r.error ? String(r.error) + ' :: ' + String(r.error.message || '') : undefined,
+        stack: r && r.stack ? String(r.stack).slice(0, 400) : undefined,
+      });
+    }, true);
+  });
 
   const consoleIssues = [];
   const consoleLogs = [];
   page.on('console', (msg) => {
     const t = msg.type();
     const text = msg.text().slice(0, 1500);
-    if (t === 'error' || t === 'warning') consoleIssues.push({ t, text });
+    if (t === 'error' || t === 'warning') consoleIssues.push({ t, text, sec: curSection });
     else if (t === 'log') consoleLogs.push(text);
   });
-  page.on('pageerror', (e) => consoleIssues.push({ t: 'pageerror', text: String(e.message || e).slice(0, 1500) }));
+  page.on('pageerror', (e) => consoleIssues.push({ t: 'pageerror', text: String(e.message || e).slice(0, 1500), sec: curSection, wall: Date.now() }));
+  // Raw browser-side log entries (CDP Log domain) — surfaces errors Blink
+  // reports before/without the page JS world (worker script failures, blob
+  // loads). Diagnostics only: NOT counted as failures.
+  const rawLog = [];
+  try {
+    const cdp = await page.createCDPSession();
+    await cdp.send('Log.enable');
+    cdp.on('Log.entryAdded', (e) => {
+      const en = e.entry || {};
+      rawLog.push({ level: en.level, src: en.source, url: String(en.url || '').slice(0, 120), text: String(en.text || '').slice(0, 220), wall: Date.now() });
+    });
+  } catch { /* CDP unavailable */ }
+  browser.on('workerfailed', (w, err) => {
+    rawLog.push({ level: 'error', src: 'worker', url: String(w.url() || '').slice(0, 120), text: String(err).slice(0, 220), wall: Date.now() });
+    console.log(`[workerfailed] ${String(w.url()).slice(0, 120)} ${String(err).slice(0, 120)}`);
+  });
 
   await page.goto(APP_URL, { waitUntil: 'networkidle2', timeout: 90000 });
   if (!(await waitFor(page, () => !!document.querySelector('select'), 30000))) {
@@ -1323,6 +1396,7 @@ async function awaitDownload(page, ms = 120000) {
       gotOut = true;
     } catch { /* stays false */ }
     check('aligned result appears (worker or main-thread fallback)', gotOut);
+    await drainDownloads(page, ' [before M1.13 aligned.wav]');
     const dl = await page.evaluate(() => {
       const b = document.querySelector('[data-testid="align-dl-aligned"]');
       if (!b) return false;
@@ -1545,8 +1619,19 @@ async function awaitDownload(page, ms = 120000) {
       if (cb && !cb.checked) cb.click();
     });
     await sleep(500);
+    await drainDownloads(page, ' [before M1.5 video export]');
     const vClicked = await h(page, 'clickText', 'Export');
-    const vdl = await awaitDownload(page, 180000);
+    // Audio companion lands first, video second — take until a container file.
+    let vdl = null;
+    const vDeadline = Date.now() + 180000;
+    while (!vdl && Date.now() < vDeadline) {
+      const d = await awaitDownload(page, 20000);
+      if (!d) continue;
+      const isVid = d.buf.length > 8
+        && (d.buf.readUInt32BE(0) === 0x1a45dfa3 || d.buf.toString('ascii', 4, 8) === 'ftyp');
+      if (isVid) vdl = d;
+      else console.log(`    [M1.5] skipped companion download: ${d.name || '?'} (${d.buf.length} B)`);
+    }
     let vOk = false;
     let vDetail = 'no download';
     if (vdl) {
@@ -1864,8 +1949,21 @@ async function awaitDownload(page, ms = 120000) {
       return out;
     });
 
+    // Flush late downloads from earlier sections (run 9: M4.5 consumed the
+    // previous section's mp4), then take exports until OUR video container
+    // lands — the audio companion (wav) arrives first.
+    await drainDownloads(page, ' [before M4.5 export]');
     const mClicked = await h(page, 'clickText', 'Export');
-    const mdl = await awaitDownload(page, 180000);
+    let mdl = null;
+    const mDeadline = Date.now() + 180000;
+    while (!mdl && Date.now() < mDeadline) {
+      const d = await awaitDownload(page, 20000);
+      if (!d) continue;
+      const isVid = d.buf.length > 8
+        && (d.buf.readUInt32BE(0) === 0x1a45dfa3 || d.buf.toString('ascii', 4, 8) === 'ftyp');
+      if (isVid) mdl = d;
+      else console.log(`    [M4.5] skipped companion download: ${d.name || '?'} (${d.buf.length} B)`);
+    }
     const samples = await samplerPromise;
     const isRed = (px) => Array.isArray(px) && px[0] > 150 && px[2] < 100;
     const isBlue = (px) => Array.isArray(px) && px[2] > 150 && px[0] < 100;
@@ -1903,13 +2001,42 @@ async function awaitDownload(page, ms = 120000) {
   }
 
   // =========================================================================
+  section('M4.5b — Pexels export frame fidelity: no stale/black/frozen frames (flicker regression)');
+  // =========================================================================
+  // Shared module (scripts/e2e-flicker-regress.cjs) so the block can also run
+  // standalone (scripts/e2e-m45b-run.cjs) for fast iteration.
+  await runFlickerRegress({ page, check, sleep, h, awaitDownload,
+    // Scan the exported file in a CLEAN page: the app page still holds the
+    // pattern clips + engine decoders and a background scan reads false blacks.
+    newPage: async () => { const p = await browser.newPage(); await p.goto('about:blank'); await p.bringToFront(); return p; },
+    // Dump the file on failure so a full-suite-only corruption can be
+    // inspected offline (ffprobe / frame extract) instead of guessed at.
+    saveFile: (name, buf) => { try {
+      fs.writeFileSync(path.join(__dirname, '..', 'docs', 'screenshots', 'full_m45b_' + (/\.(mp4|webm|mkv)$/.test(name) ? name : 'export.bin')), buf);
+    } catch { /* diagnostic only */ } },
+  });
+
+  // =========================================================================
+  section('M1.14 — Karaoke burn-in: gate, SRT download, overlay pixels');
+  // =========================================================================
+  // Shared module (scripts/e2e-karaoke-regress.cjs) so the block can also run
+  // standalone (scripts/e2e-karaoke-run.cjs) for fast iteration.
+  await runKaraokeRegress({ page, check, sleep, h, awaitDownload });
+
+  // =========================================================================
   section('M4.4 — Console: zero unexpected issues over the whole run');
   // =========================================================================
   {
     const KNOWN_BENIGN = []; // reviewed after first run; add with a comment each
+    const mediaErrs = await page.evaluate(() => window.__nmpErr || []).catch(() => []);
+    if (mediaErrs.length) console.log('  [error-event attribution]', JSON.stringify(mediaErrs));
+    if (rawLog.length) {
+      console.log(`  [cdp-raw-log] ${rawLog.length} entries`);
+      for (const r of rawLog.slice(-25)) console.log(`    [+${((r.wall - RUN_T0) / 1000).toFixed(0)}s ${r.level} ${r.src}] ${r.text} :: ${r.url}`);
+    }
     const unexpected = consoleIssues.filter((i) => !KNOWN_BENIGN.some((k) => i.text.includes(k)));
     check('0 unexpected console errors/warnings', unexpected.length === 0,
-      unexpected.length ? unexpected.slice(0, 5).map((x) => `${x.t}: ${x.text}`).join(' || ') : 'clean');
+      unexpected.length ? unexpected.slice(0, 5).map((x) => `[${x.sec || '?'}${x.wall ? ' +' + ((x.wall - RUN_T0) / 1000).toFixed(0) + 's' : ''}] ${x.t}: ${x.text}`).join(' || ') : 'clean');
     if (consoleIssues.length) {
       console.log(`  (total collected: ${consoleIssues.length}${unexpected.length ? ' — see above' : ', all benign'})`);
     }
