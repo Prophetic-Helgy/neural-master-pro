@@ -1,4 +1,4 @@
-# Neural Master Pro 2.5
+# Neural Master Pro 2.6
 
 **100% offline AI-music mastering.** Turn AI-generated (or any other) tracks into release-ready masters — loudness, true peak and tone dialed to each platform's requirements — without a single byte leaving your device.
 
@@ -22,7 +22,8 @@ Platforms (Spotify, Apple Music, YouTube, TikTok…) reject or demonetize tracks
 - **Pro — realtime mixer**: Faust-based DSP engine: tonal balance (drive / lows / mids / high air), graphic EQ + 4-band parametric EQ, FX (autotune, reverb, distortion, delay, chorus) + 10 VST-class modules (bus compressor, noise gate, transient shaper, de-esser, tape saturation, air exciter, bitcrusher, stereo widener + MONO, phaser, flanger, tremolo), FX automation regions, 7 visualizer modes.
 - **Stem Studio**: solo-audition each stem — Bass, Vocal, Mid, Side (center-band crossover + M/S reconstruction, deterministic DSP, not ML separation) — dial per-stem FX (5 dedicated vocal FX), and export all four stems as a WAV ZIP.
 - **Vocal Align**: upload a guide and a double, and the dub is time-mapped onto the guide's phrasing (envelope onset matching + WSOLA stretching — pitch preserved); strength and max-stretch guards, aligned WAV / guide+aligned mix download.
-- **Pexels backgrounds cut on peaks**: stock-video backgrounds (bring your own free API key) switch clips on the track's detected audio peaks with crossfades — video editing that follows the music.
+- **Pexels backgrounds cut on peaks**: stock-video backgrounds (bring your own free API key) switch clips on the track's detected audio peaks with crossfades — video editing that follows the music, with frame-faithful export (no stale/black frames).
+- **Karaoke subtitles — offline Whisper ASR**: tick a checkbox at video export and the bundled Whisper model transcribes the song word-by-word, entirely on your machine (no cloud, ever). Edit the recognized lines, pick karaoke or plain-subtitle style, burn them into the clip and download the matching `.srt`.
 - **Batch mode**: queue up to 20 files, per-file progress, one-click ZIP export of all masters.
 - **Reference matching**: load a reference track and match its integrated loudness.
 - **Export**: WAV 16/24/32-bit float, MP3 192/320 kbps, FLAC, AAC 128/256 kbps (m4a, with title/artist metadata) — plus visualizer video export. All encoding happens locally.
@@ -32,7 +33,7 @@ Platforms (Spotify, Apple Music, YouTube, TikTok…) reject or demonetize tracks
 ## Requirements
 
 - Windows 10/11 x64
-- No internet connection needed — the app is fully offline
+- No internet connection needed — the app is fully offline (the Whisper ASR model ships inside the installer, which is why it is ~250 MB)
 
 ## Download
 
@@ -44,15 +45,16 @@ Grab the latest build from [GitHub Releases](https://github.com/Prophetic-Helgy/
 Every release lists a SHA-256 checksum per file. Verify with:
 
 ```powershell
-Get-FileHash .\Neural.Master.Pro.2.5.Setup.2.5.0.exe -Algorithm SHA256
+Get-FileHash .\Neural.Master.Pro.2.6.Setup.2.6.0.exe -Algorithm SHA256
 ```
 
 ## Build from source
 
 ```bash
 npm install
-npm run dev        # Vite dev loop on http://localhost:3000
-npm run build:exe  # portable + NSIS installer into release/
+npm run fetch:models  # one-time Whisper ASR model download (~78 MB, gitignored; build:exe does it too)
+npm run dev           # Vite dev loop on http://localhost:3000
+npm run build:exe     # portable + NSIS installer into release/
 ```
 
 ## License
@@ -67,7 +69,7 @@ Proprietary, source publicly available — see [LICENSE](LICENSE). Free for pers
 
 ---
 
-# Neural Master Pro 2.5 (RU)
+# Neural Master Pro 2.6 (RU)
 
 **Полностью офлайн-мастеринг AI-музыки.** Превращает треки, созданные нейросетями (или любые другие), в релизные мастер-копии — громкость, true peak и тон точно под требования площадок — ни один байт не покидает ваше устройство.
 
@@ -83,7 +85,8 @@ Proprietary, source publicly available — see [LICENSE](LICENSE). Free for pers
 - **Pro — realtime-микшер**: DSP-движок на Faust: тон (drive / lows / mids / high air), графический + 4-полосный параметрический EQ, эффекты (autotune, reverb, distortion, delay, chorus) + 10 VST-модулей (bus-компрессор, noise gate, transient shaper, деэссер, tape saturation, air exciter, bitcrusher, widener + MONO, phaser, flanger, tremolo), регионы автоматизации FX, 7 режимов визуализатора.
 - **Stem Studio**: соло-прослушка стемов — Bass, Vocal, Mid, Side (кроссовер центральной полосы + M/S-реконструкция, детерминированный DSP, без ML-разделения), отдельные FX для каждого стема (5 эффектов вокала) и экспорт всех четырёх стемов ZIP-архивом WAV'ов.
 - **Vocal Align**: загрузите гайд и дубль — дубль по времени подтягивается к фразировке гайда (совпадение onset-огибаемых + WSOLA-растяжение с сохранением высоты тона); регуляторы силы и макс. растяжения, скачивание выровненного WAV и микса гайд+align.
-- **Фоны Pexels по пикам**: стоковые видео-фоны (нужен ваш бесплатный API-ключ) переключаются по детектированным пикам аудио с кроссфейдами — видеомонтаж, следующий за музыкой.
+- **Фоны Pexels по пикам**: стоковые видео-фоны (нужен ваш бесплатный API-ключ) переключаются по детектированным пикам аудио с кроссфейдами — видеомонтаж, следующий за музыкой, с честным экспортом кадров (без «моргания» и чёрных вспышек).
+- **Субтитры-караоке — офлайн Whisper ASR**: поставьте галочку при экспорте видео — встроенная модель Whisper пословно распознает песню полностью на вашем устройстве (никакого облака). Распознанные строки редактируются, стиль — караоке или обычные субтитры; всё вжигается в ролик, рядом скачивается `.srt`.
 - **Batch-режим**: очередь до 20 файлов, прогресс по каждому, ZIP-экспорт всех мастеров одним кликом.
 - **Сопоставление с референсом**: загрузите референс-трек и подгоните интегрированную громкость.
 - **Экспорт**: WAV 16/24/32-bit float, MP3 192/320 kbps, FLAC, AAC 128/256 kbps (m4a, с метаданными title/artist) + видео-визуализация. Всё кодирование — локально.
@@ -92,7 +95,7 @@ Proprietary, source publicly available — see [LICENSE](LICENSE). Free for pers
 
 ## Требования
 
-- Windows 10/11 x64, интернет не требуется
+- Windows 10/11 x64, интернет не требуется (модель Whisper вшита в инсталлятор — поэтому он ~250 МБ)
 
 ## Загрузка
 
@@ -102,8 +105,9 @@ Proprietary, source publicly available — see [LICENSE](LICENSE). Free for pers
 
 ```bash
 npm install
-npm run dev        # Vite-цикл разработки на http://localhost:3000
-npm run build:exe  # portable + NSIS-инсталлятор в release/
+npm run fetch:models  # разовая загрузка модели Whisper ASR (~78 МБ, в git не попадает; build:exe делает это сам)
+npm run dev           # Vite-цикл разработки на http://localhost:3000
+npm run build:exe     # portable + NSIS-инсталлятор в release/
 ```
 
 ## Лицензия
