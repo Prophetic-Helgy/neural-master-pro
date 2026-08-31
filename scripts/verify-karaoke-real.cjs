@@ -139,13 +139,14 @@ async function takeDownload(page) {
   await sleep(300);
   await page.screenshot({ path: path.join(SHOTS, 'karaoke_editor.png') });
 
-  // Screenshot 2: karaoke style selected.
+  // Screenshot 2: subtitle style selected — proves the toggle is live (the
+  // karaoke view is already covered by karaoke_editor.png).
   await page.evaluate(() => {
-    const r = [...document.querySelectorAll('input[type="radio"][name="karaokeStyle"]')][0];
-    if (r) { if (!r.checked) r.click(); r.scrollIntoView({ block: 'center' }); }
+    const r = [...document.querySelectorAll('input[type="radio"][name="karaokeStyle"]')][1];
+    if (r && !r.checked) { r.click(); r.scrollIntoView({ block: 'center' }); }
   });
   await sleep(300);
-  await page.screenshot({ path: path.join(SHOTS, 'karaoke_style_karaoke.png') });
+  await page.screenshot({ path: path.join(SHOTS, 'karaoke_style_subs.png') });
 
   // Download the .srt through the real button.
   await page.evaluate(() => {
